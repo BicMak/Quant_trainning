@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.manifest
+*.spec
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.env/
+
+# PyTorch / ML
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoints/
+weights/
+logs/
+runs/
+wandb/
+mlruns/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
+datasets/
+*.csv
+*.json
+*.pkl
+*.npy
+*.npz
+
+# Misc
+*.log
+*.tmp
+*.bak
+.cache/
