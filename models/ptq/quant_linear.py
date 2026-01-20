@@ -6,7 +6,7 @@ import copy
 from torch import Tensor
 import os
 
-from .observer_config import ObserverConfig, BitTypeConfig
+from .observer_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
@@ -16,7 +16,7 @@ class QuantLinear(nn.Module):
     def __init__(self, 
                  quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         # observer 초기화
         super(QuantLinear, self).__init__()
 
@@ -119,7 +119,7 @@ class QuantLinear(nn.Module):
 def test_quant_linear(observer_type='PercentileObserver'):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type=observer_type
@@ -135,9 +135,9 @@ def test_quant_linear(observer_type='PercentileObserver'):
             self.fc4 = nn.Linear(128, 10)
             
         def forward(self, x):
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
-            x = F.relu(self.fc3(x))
+            x = self.fc1(x)
+            x = self.fc2(x)
+            x = self.fc3(x)
             x = self.fc4(x)
             return x
     
@@ -238,20 +238,147 @@ def test_quant_linear(observer_type='PercentileObserver'):
     print(f"\n=== {observer_type} 테스트 완료 ===\n")
 
 
+def test_with_profiler():
+    """Profiler 테스트 - 레이어별 출력 QSNR 측정"""
+    from .layer_profiler import StatProfiler, TimeProfiler, HistProfiler
+
+    print("="*60)
+    print("Testing QuantLinear with Profilers (Layer-wise Output QSNR)")
+    print("="*60)
+
+    # 1. Config 설정
+    bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
+    observer_config = QuantConfig(
+        calibration_mode='layer_wise',
+        bit_type=bit_config,
+        observer_type='PercentileObserver'
+    )
+
+    # 2. SimpleMLP 생성 및 QuantLinear 변환
+    class SimpleMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(784, 512)
+            self.fc2 = nn.Linear(512, 256)
+            self.fc3 = nn.Linear(256, 128)
+            self.fc4 = nn.Linear(128, 10)
+
+    mlp = SimpleMLP()
+
+    # QuantLinear로 변환
+    quant_layers = {}
+    for name, layer in mlp.named_modules():
+        if isinstance(layer, nn.Linear):
+            quant_layers[name] = QuantLinear(
+                quant_args={},
+                input_module=layer,
+                observer_config=observer_config
+            )
+
+    print(f"Converted {len(quant_layers)} layers: {list(quant_layers.keys())}")
+
+    # 3. 더미 데이터
+    num_batches = 16
+    batch_size = 32
+    calib_data = [torch.randn(batch_size, 784) for _ in range(num_batches)]
+
+    # 4. Calibration
+    print("\n=== Calibration ===")
+    for x in calib_data:
+        out = x
+        for name in ['fc1', 'fc2', 'fc3', 'fc4']:
+            out = quant_layers[name].calibration(out)
+            if name != 'fc4':
+                out = F.relu(out)
+
+    # Quantization params 계산
+    for name, layer in quant_layers.items():
+        layer.compute_quant_params()
+    print("Calibration 완료")
+
+    # 5. 레이어별 출력 QSNR 측정
+    print("\n=== 레이어별 출력 QSNR (Output Quality) ===")
+    test_input = torch.randn(1, 784)
+
+    layer_stats = {}
+    x_fp32 = test_input
+    x_quant = test_input
+
+    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
+        layer = quant_layers[name]
+
+        # FP32 forward
+        layer.mode = 'fp32'
+        out_fp32 = layer(x_fp32)
+
+        # Quantized forward
+        layer.mode = 'quantized'
+        out_quant = layer(x_quant)
+
+        # 출력 비교 (이게 진짜 중요!)
+        stats = StatProfiler.compute(out_fp32, out_quant)
+        layer_stats[name] = stats
+
+        print(f"\n{name} Output:")
+        print(f"  MSE: {stats['mse']:.6f}")
+        print(f"  Cosine Sim: {stats['cosine_sim']:.4f}")
+        print(f"  QSNR: {stats['qsnr']:.2f} dB")  # 출력이니까 QSNR이 의미있음
+
+        # 다음 레이어 입력 준비 (ReLU 적용)
+        if name != 'fc4':
+            x_fp32 = F.relu(out_fp32)
+            x_quant = F.relu(out_quant)
+
+    # 6. 최종 출력 비교
+    print("\n=== 전체 모델 출력 비교 ===")
+
+    # 전체 FP32
+    out = test_input
+    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
+        quant_layers[name].mode = 'fp32'
+        out = quant_layers[name](out)
+        if name != 'fc4':
+            out = F.relu(out)
+    final_fp32 = out
+
+    # 전체 Quantized
+    out = test_input
+    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
+        quant_layers[name].mode = 'quantized'
+        out = quant_layers[name](out)
+        if name != 'fc4':
+            out = F.relu(out)
+    final_quant = out
+
+    final_stats = StatProfiler.compute(final_fp32, final_quant)
+    print(f"Final MSE: {final_stats['mse']:.6f}")
+    print(f"Final Cosine Sim: {final_stats['cosine_sim']:.4f}")
+    print(f"Final QSNR: {final_stats['qsnr']:.2f} dB")
+
+    print("\n=== 모든 Profiler 테스트 완료 ===")
+
+
 if __name__ == "__main__":
-    observer_types = ['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KVObserver']
-    
+    # 기본 테스트
+    observer_types = ['MinmaxObserver', 'PercentileObserver']
+
     print("="*60)
-    print("Testing All Observer Types")
+    print("Testing QuantLinear")
     print("="*60)
-    
+
     for observer_type in observer_types:
         try:
             test_quant_linear(observer_type=observer_type)
         except Exception as e:
-            print(f"\n❌ {observer_type} 테스트 실패")
+            print(f"\n{observer_type} 테스트 실패")
             print(f"Error: {e}\n")
-    
+
+    # Profiler 테스트
+    try:
+        test_with_profiler()
+    except Exception as e:
+        print(f"\nProfiler 테스트 실패: {e}")
+
     print("="*60)
     print("모든 테스트 완료")
     print("="*60)

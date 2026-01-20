@@ -6,7 +6,7 @@ import copy
 from torch import Tensor
 import os
 
-from .observer_config import ObserverConfig, BitTypeConfig
+from .observer_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
@@ -16,7 +16,7 @@ class QuantConv2d(nn.Module):
     def __init__(self,
                  quant_args:dict,
                  input_module:nn.Conv2d,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         super(QuantConv2d, self).__init__()
 
         #0. observer config copy
@@ -120,7 +120,7 @@ class QuantConv2d(nn.Module):
 def test_quant_conv(observer_type='PercentileObserver'):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type=observer_type

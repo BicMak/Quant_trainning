@@ -5,7 +5,7 @@ import torchvision.models as models
 import copy
 from torch import Tensor
 
-from models.ptq.quant_layer import QuantLinear
+from models.ptq.quant_linear import QuantLinear
 
 from .observer_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType

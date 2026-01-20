@@ -9,10 +9,10 @@ class BitTypeConfig:
     name: str = 'int8'
 
 @dataclass
-class ObserverConfig:
+class QuantConfig:
     calibration_mode: Literal['layer_wise', 'channel_wise'] = 'layer_wise'
     bit_type: BitTypeConfig = field(default_factory=lambda: BitTypeConfig())
-    observer_type: Literal['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KLObserver'] = 'MinmaxObserver'
+    observer_type: Literal['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KLObserver'] = 'PercentileObserver'
     
     # Percentile observer parameters
     percentile_alpha: float = 0.9999

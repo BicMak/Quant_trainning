@@ -6,7 +6,7 @@ import copy
 from torch import Tensor
 import os
 
-from .observer_config import ObserverConfig, BitTypeConfig
+from .observer_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
@@ -16,7 +16,7 @@ class QLayerNorm(nn.Module):
     def __init__(self, 
                  quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         # observer 초기화
         super(QLayerNorm, self).__init__()
 
@@ -162,7 +162,7 @@ class QLayerNorm(nn.Module):
 def test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         calibration_mode='channel_wise',
         bit_type=bit_config,
         observer_type=observer_type
@@ -240,8 +240,12 @@ def test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True):
     for name, layer in quant_ln_layers.items():
         print(f"\n{name}:")
         print(f"  Observer type: {type(layer.output_observer).__name__}")
-        print(f"  Output min_val: {layer.output_observer.min_val}")
-        print(f"  Output max_val: {layer.output_observer.max_val}")
+        if layer.output_observer.min_val.shape == torch.Size([]):
+            print(f"  Output min_val: {layer.output_observer.min_val.item()}")
+            print(f"  Output max_val: {layer.output_observer.max_val.item()}")
+        else:     
+            print(f"  Output min_val: {layer.output_observer.min_val}")
+            print(f"  Output max_val: {layer.output_observer.max_val}")
 
     # ========== 7. Quantization Params 계산 (2차: PTF alpha 탐색) ==========
     print("\n=== Quantization Parameters 계산 ===")

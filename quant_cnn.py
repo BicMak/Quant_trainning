@@ -5,7 +5,7 @@ import torchvision.models as models
 import copy
 from torch import Tensor
 
-from observer_config import ObserverConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from layer_observer.minmax import MinmaxObserver
 from layer_observer.percentile import PercentileObserver
 from layer_observer.omse import OmseObserver
@@ -65,7 +65,7 @@ class QuantLinear(nn.Module):
     def __init__(self, 
                  quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         # observer 초기화
         super(QuantLinear, self).__init__()
 
@@ -161,7 +161,7 @@ class QuantConv(nn.Module):
     def __init__(self, 
                  quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         # observer 초기화
         super(QuantConv, self).__init__()
 
@@ -265,7 +265,7 @@ class QuantConv(nn.Module):
 def test_quant_linear():
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=False, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type='PercentileObserver'
@@ -383,7 +383,7 @@ def test_quant_linear():
 def test_quant_conv():
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=False, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type='MinmaxObserver'

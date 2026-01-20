@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .observer_config import ObserverConfig, BitTypeConfig
+from .observer_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 
 
@@ -12,7 +12,7 @@ class QuantIntSoft(nn.Module):
     def __init__(self, 
                  quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:ObserverConfig):
+                 observer_config:QuantConfig):
         super(QuantIntSoft, self).__init__()
 
         #0. observer config copy
@@ -150,7 +150,7 @@ def main():
 
     # 1. Observer co    nfig 생성
     bit_type_config = BitTypeConfig(bits=8, signed=False, name='uint8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         observer_type='PercentileObserver',
         bit_type=bit_type_config,
         calibration_mode='layer_wise'
@@ -259,7 +259,7 @@ def test_full_attention_pipeline(observer_type='PercentileObserver'):
 
     # ========== 1. Config 설정 ==========
     bit_type_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         observer_type=observer_type,
         bit_type=bit_type_config,
         calibration_mode='layer_wise'
