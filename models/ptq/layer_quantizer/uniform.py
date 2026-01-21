@@ -25,12 +25,12 @@ class UniformQuantizer(BaseQuantizer):
         self.scale, self.zero_point = scale, zero_point
 
     def quant(self, inputs, scale=None, zero_point=None):
-        
+
         if scale is None:
             scale = self.scale
         if zero_point is None:
             zero_point = self.zero_point
-        
+
         range_shape = self.get_reshape_range(inputs)
         scale = scale.reshape(range_shape)
         zero_point = zero_point.reshape(range_shape)

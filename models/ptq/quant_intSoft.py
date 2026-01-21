@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from ...quant_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 
 class QuantIntSoft(nn.Module):
@@ -52,8 +52,8 @@ class QuantIntSoft(nn.Module):
             return (self.output_scale, None)
         else:
             # PTQ fallback 모드
-            self.scaler, self.zero = self.observer.get_quantization_params()
-            self.quantizer.update_quantization_params(self.scaler, self.zero)
+            self.scaler, self.zero = 1, 0 
+            # 매서드 일관성을 위해서 임의이값을 넣어줌
 
             return (self.scaler, self.zero)
 
@@ -119,6 +119,9 @@ class QuantIntSoft(nn.Module):
         """
         if self.mode == 'quantized':
             # I-BERT Integer-only Softmax
+            # scale이 None이면 self.input_scale 사용
+            if scale is None:
+                scale = self.input_scale
             exp_int, exp_int_sum = self.int_softmax(x, scale)
             softmax_out = torch.round(exp_int_sum / exp_int)
             rounds = self.log_round(softmax_out)

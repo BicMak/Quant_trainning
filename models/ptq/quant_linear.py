@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-import copy
 from torch import Tensor
 import os
 
@@ -38,14 +37,22 @@ class QuantLinear(nn.Module):
                                         'linear_weight',
                                         self.calibration_mode,
                                         self.quant_config)
-        self.output_observer = copy.deepcopy(self.observer) #deepcopy for output observer
+        # output_observer는 별도로 초기화 (activation 타입으로)
+        self.output_observer = init_observers(self.observer_type,
+                                              self.bit_type,
+                                              'activation',
+                                              self.calibration_mode,
+                                              self.quant_config)
 
         #2. quantizer build
         self.quantizer = build_quantizer(
-            quantizer_str='uniform', 
+            quantizer_str='uniform',
             bit_type=self.bit_type,
             module_type='linear_weight')
-        self.output_quantizer = copy.deepcopy(self.quantizer)
+        self.output_quantizer = build_quantizer(
+            quantizer_str='uniform',
+            bit_type=self.bit_type,
+            module_type='activation')  # output은 activation type
 
         #2. layer initialization  
         self.fwd_kwargs = dict()
@@ -84,8 +91,13 @@ class QuantLinear(nn.Module):
             )   
         
         # weight quantization, save quant_weight
+        # scaler와 zero를 올바른 shape으로 reshape
+        range_shape = self.quantizer.get_reshape_range(self.weight)
+        scaler_reshaped = self.scaler.reshape(range_shape)
+        zero_reshaped = self.zero.reshape(range_shape)
+
         self.quant_weight = torch.clamp(
-            torch.round(self.weight / self.scaler) + self.zero,
+            torch.round(self.weight / scaler_reshaped) + zero_reshaped,
             min=self.bit_type.lower_bound,
             max=self.bit_type.upper_bound
         )

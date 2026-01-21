@@ -70,7 +70,7 @@ class QAct(nn.Module):
             x = self.act_module(x)
 
         if self.mode == 'quantized':
-            x = self.quantizer.quant(x)
-        
+            x = self.quantizer.forward(x)  # fake quantization: quant -> dequant
+
         return x
 
