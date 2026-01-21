@@ -15,7 +15,7 @@ class QuantConfig:
     observer_type: Literal['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KLObserver'] = 'PercentileObserver'
     
     # Percentile observer parameters
-    percentile_alpha: float = 0.9999
+    percentile_alpha: float = 0.95
     percentile_sigma: float = 0.01
     
     # Kv observer parameters
