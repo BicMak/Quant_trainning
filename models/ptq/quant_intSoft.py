@@ -98,6 +98,7 @@ class QuantIntSoft(nn.Module):
 
     @staticmethod
     def int_softmax(x, scaling_factor):
+        scaling_factor = scaling_factor.to(x.device)
         x_int = x / scaling_factor
 
         #for numerical stability

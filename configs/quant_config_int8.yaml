@@ -11,7 +11,7 @@ default:
     name: int8
   observer_type: PercentileObserver  # MinmaxObserver, PercentileObserver, OmseObserver, KLObserver
   quantization_method: Uniform  # Uniform or Log2
-  percentile_alpha: 0.95
+  percentile_alpha: 0.999
   percentile_sigma: 0.01
   kv_bins: 2048
 
@@ -75,7 +75,7 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
+    percentile_alpha: 0.999
     percentile_sigma: 0.01
 
   # LayerNorm 2 (before MLP)
@@ -87,7 +87,7 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
+    percentile_alpha: 0.999
     percentile_sigma: 0.01
 
 # ==================== Activation Quantization Configurations ====================
@@ -100,7 +100,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
     percentile_sigma: 0.0001
@@ -112,7 +112,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
     percentile_sigma: 0.0001
@@ -125,7 +125,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
     percentile_sigma: 0.0001
@@ -138,7 +138,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.99
     percentile_sigma: 0.01
@@ -150,7 +150,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.99
     percentile_sigma: 0.01

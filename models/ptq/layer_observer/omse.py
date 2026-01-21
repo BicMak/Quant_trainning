@@ -8,87 +8,67 @@ from ..bit_type import BitType
 
 
 class OmseObserver(BaseObserver):
-    """
-    OMSE (Optimal MSE) Observer for Weight Quantization Only.
-
-    Uses grid search to find optimal clipping range that minimizes L2 loss.
-    NOT recommended for activation quantization due to memory constraints.
-    Use PercentileObserver or MinmaxObserver for activations instead.
-    """
-    def __init__(self,
-                 bit_type,
-                 module_type,
-                 calibration_mode):
-        # Activation은 지원하지 않음
-        if module_type == 'activation':
-            raise ValueError(
-                "OmseObserver is not supported for activation quantization. "
-                "Reason: OMSE requires storing full tensor for grid search, "
-                "which causes memory explosion with multiple calibration batches. "
-                "Use PercentileObserver or MinmaxObserver for activations instead."
-            )
-
-        super(OmseObserver, self).__init__(bit_type, module_type,
-                                           calibration_mode)
-
+    def __init__(self, bit_type, module_type, calibration_mode):
+        # Activation도 이제 지원 가능!
+        super().__init__(bit_type, module_type, calibration_mode)
+        
         self.symmetric = self.bit_type.signed
         self.max_val = None
         self.min_val = None
-        self.device = None
-        self.v = None
-
+        self.calibration_data = []  # FP32 배치들을 저장
+        self.max_batches = 10  # 메모리 제한 (선택사항)
+    
     def update(self, v):
-        """
-        Update observer with weight tensor.
-
-        For weight quantization, multiple calls will merge data
-        (though typically weights are fixed and only need one call).
-        """
-        # device check 1st time
-        if self.device is None:
-            self.device = v.device.type
-
-        # test device match
-        if self.device != v.device.type:
-            raise ValueError(
-                "Device type mismatch in observer."
-                f"Expected device type: {self.device}, but got: {v.device.type}")
-
+        """배치마다 호출 - FP32 저장 + min/max 업데이트"""
         v = self.reshape_tensor(v)
-
-        # Weight 갱신: 최초면 할당, 이후면 concat (weight는 보통 1번만 호출)
-        if self.v is None:
-            self.v = v.detach()
-        else:
-            self.v = torch.cat([self.v, v.detach()], dim=1)
-
+        
+        # 1. FP32 데이터 저장 (나중에 OMSE 계산용)
+        self.calibration_data.append(v.detach().cpu())  # CPU로 옮겨서 GPU 메모리 절약
+        
+        # 메모리 제한 (선택사항)
+        if len(self.calibration_data) > self.max_batches:
+            self.calibration_data.pop(0)  # 오래된 배치 제거
+        
+        # 2. Min/Max 통계 업데이트 (layer/channel-wise)
         cur_max = v.max(axis=1).values
+        cur_min = v.min(axis=1).values
+        
         if self.max_val is None:
             self.max_val = cur_max
-        else:
-            self.max_val = torch.max(cur_max, self.max_val)
-        
-        cur_min = v.min(axis=1).values
-        if self.min_val is None:
             self.min_val = cur_min
         else:
+            self.max_val = torch.max(cur_max, self.max_val)
             self.min_val = torch.min(cur_min, self.min_val)
-
+        
+        # 3. layer_wise면 스칼라로 변환
         if self.calibration_mode == 'layer_wise':
             self.max_val = self.max_val.max()
             self.min_val = self.min_val.min()
-
+    
     def get_quantization_params(self):
-        max_val = self.max_val
-        min_val = self.min_val
+        """Grid search with all calibration data"""
+        # 저장된 모든 배치를 합쳐서 OMSE 계산
+        all_data = torch.cat(self.calibration_data, dim=1)  # 모든 배치 concat
+        
+        # GPU로 옮겨서 grid search
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        all_data = all_data.to(device)
+        
+        max_val = self.max_val.to(device)
+        min_val = self.min_val.to(device)
         qmax = self.bit_type.upper_bound
         qmin = self.bit_type.lower_bound
-
+        
         best_score = 1e+10
-        for i in range(90):
-            new_max = max_val * (1.0 - (i * 0.01))
-            new_min = min_val * (1.0 - (i * 0.01))
+        search_iterations = 100
+        keep_ratios = torch.logspace(0, -4, steps=search_iterations).to(device)
+        
+        # Grid search (90 iterations)
+        for keep_ratio in keep_ratios:
 
+            new_max = max_val * keep_ratio
+            new_min = min_val * keep_ratio
+            
             if self.symmetric:
                 new_max = torch.max(-new_min, new_max)
                 new_scale = new_max / (float(qmax - qmin) / 2)
@@ -97,33 +77,34 @@ class OmseObserver(BaseObserver):
                 new_scale = (new_max - new_min) / float(qmax - qmin)
                 new_zero_point = qmin - torch.round(new_min / new_scale)
                 new_zero_point.clamp_(qmin, qmax)
-                
-            # layer_wise면 스칼라, channel_wise면 vector
+            
+            # Quantize & Dequantize
             if self.calibration_mode == 'layer_wise':
-                # unsqueeze 불필요
-                inputs_q = ((self.v / new_scale + new_zero_point).round().clamp(
+                inputs_q = ((all_data / new_scale + new_zero_point).round().clamp(
                     qmin, qmax) - new_zero_point) * new_scale
             else:
-                # channel_wise일 때만 unsqueeze
+                # channel_wise
                 new_scale_expanded = new_scale.unsqueeze(1)
                 new_zero_point_expanded = new_zero_point.unsqueeze(1)
-                inputs_q = ((self.v / new_scale_expanded + new_zero_point_expanded).round().clamp(
+                inputs_q = ((all_data / new_scale_expanded + new_zero_point_expanded).round().clamp(
                     qmin, qmax) - new_zero_point_expanded) * new_scale_expanded
-
-            # L_p norm minimization as described in LAPQ
-            # https://arxiv.org/abs/1911.07190
-            score = lp_loss(self.v, inputs_q, p=2.0, reduction='all')
+            
+            # L2 loss
+            score = lp_loss(all_data, inputs_q, p=2.0, reduction='all')
+            
             if score < best_score:
-                # print(f"Best score updated: {score}")
-                # print(f"original max: {self.max_val}, original min: {self.min_val}")
-                # print(f"New max: {new_max}, New min: {new_min}")
                 best_score = score
                 self.max_val = new_max
                 self.min_val = new_min
                 scale = new_scale
                 zero_point = new_zero_point
         
+        # 메모리 정리
+        del all_data
+        self.calibration_data.clear()  # 더 이상 필요 없음
+        
         return scale, zero_point
+
     
 def main():
     print("=" * 70)

@@ -25,11 +25,16 @@ class UniformQuantizer(BaseQuantizer):
         self.scale, self.zero_point = scale, zero_point
 
     def quant(self, inputs, scale=None, zero_point=None):
-
+        
+        #check the None of parameter
         if scale is None:
             scale = self.scale
         if zero_point is None:
             zero_point = self.zero_point
+
+        scale = scale.to(inputs.device)
+        zero_point = zero_point.to(inputs.device)
+        
 
         range_shape = self.get_reshape_range(inputs)
         scale = scale.reshape(range_shape)
@@ -45,7 +50,10 @@ class UniformQuantizer(BaseQuantizer):
             scale = self.scale
         if zero_point is None:
             zero_point = self.zero_point
-            
+        
+        scale = scale.to(inputs.device)
+        zero_point = zero_point.to(inputs.device)
+                    
         range_shape = self.get_reshape_range(inputs)
         scale = scale.reshape(range_shape)
         zero_point = zero_point.reshape(range_shape)
