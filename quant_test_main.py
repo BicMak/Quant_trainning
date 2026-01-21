@@ -5,7 +5,7 @@ import torchvision.models as models
 import copy
 from torch import Tensor
 
-from quant_config import QuantConfig, BitTypeConfig
+from observer_config import ObserverConfig, BitTypeConfig
 from layer_observer.minmax import MinmaxObserver
 
 from models.ptq.bit_type import BitType
@@ -18,7 +18,7 @@ from layer_quantizer.build import build_quantizer
 def test_quant_linear():
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=False, name='int8')
-    observer_config = QuantConfig(
+    observer_config = ObserverConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type='PercentileObserver'
