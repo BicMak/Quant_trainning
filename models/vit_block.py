@@ -3,8 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Union
 from pathlib import Path
+from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
 from .ptq.quant_linear import QuantLinear
 from .ptq.quant_intSoft import QuantIntSoft
@@ -590,14 +592,465 @@ class QuantTimmVitBlock(nn.Module):
 
         plt.close()
 
+    def update_all_layer_stats(self, test_input: torch.Tensor):
+        """
+        Update profiler statistics for ALL quantized layers.
+        Captures FP32 vs Quantized values for weights and activations.
+        """
+        if not self.enable_profiling:
+            return
 
-def test_vit_block(config_path: Union[str, Path] = None):
+        # 1. Weight layers (Linear)
+        self.update_profiler_weights()
+
+        # 2. All activation layers - capture intermediate activations
+        self._capture_all_activations(test_input)
+
+    def _capture_all_activations(self, test_input: torch.Tensor):
+        """Capture FP32 and Quantized activations for all layers"""
+        if not self.enable_profiling:
+            return
+
+        with torch.no_grad():
+            B, N, C = test_input.shape
+
+            # === FP32 Mode ===
+            self.set_mode('fp32')
+            fp32_activations = {}
+
+            # norm1
+            x_norm1_fp32 = self.norm1.forward(test_input)
+            fp32_activations['norm1'] = x_norm1_fp32.clone()
+
+            # attn_qkv
+            qkv_fp32 = self.attn_qkv.forward(x_norm1_fp32)
+            fp32_activations['attn_qkv'] = qkv_fp32.clone()
+
+            # attn_qkv_output
+            qkv_out_fp32 = self.attn_qkv_output.forward(qkv_fp32)
+            fp32_activations['attn_qkv_output'] = qkv_out_fp32.clone()
+
+            qkv_fp32 = qkv_out_fp32.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv_fp32.unbind(0)
+
+            # kv_act
+            attn_fp32 = (q @ k.transpose(-2, -1)) * self.scale
+            kv_act_fp32 = self.kv_act.forward(attn_fp32)
+            fp32_activations['kv_act'] = kv_act_fp32.clone()
+
+            # intSoft
+            scale_param = self.kv_act.scaler if hasattr(self.kv_act, 'scaler') else None
+            intsoft_fp32 = self.intSoft.forward(kv_act_fp32, scale=scale_param)
+            fp32_activations['intSoft'] = intsoft_fp32.clone()
+
+            intsoft_fp32 = self.attn_drop(intsoft_fp32)
+
+            # attn_proj
+            x_attn_fp32 = (intsoft_fp32 @ v).transpose(1, 2).reshape(B, N, C)
+            attn_proj_fp32 = self.attn_proj.forward(x_attn_fp32)
+            fp32_activations['attn_proj'] = attn_proj_fp32.clone()
+
+            # sv_attn
+            sv_attn_fp32 = self.sv_attn.forward(attn_proj_fp32)
+            fp32_activations['sv_attn'] = sv_attn_fp32.clone()
+
+            sv_attn_fp32 = self.proj_drop(sv_attn_fp32)
+
+            # residual1
+            x_res1_fp32 = test_input + self.drop_path1(sv_attn_fp32)
+            residual1_fp32 = self.residual1.forward(x_res1_fp32)
+            fp32_activations['residual1'] = residual1_fp32.clone()
+
+            # norm2
+            x_norm2_fp32 = self.norm2.forward(residual1_fp32)
+            fp32_activations['norm2'] = x_norm2_fp32.clone()
+
+            # mlp_fc1
+            mlp_fc1_fp32 = self.mlp_fc1.forward(x_norm2_fp32)
+            fp32_activations['mlp_fc1'] = mlp_fc1_fp32.clone()
+
+            # mlp_act
+            mlp_act_fp32 = self.mlp_act.forward(mlp_fc1_fp32)
+            fp32_activations['mlp_act'] = mlp_act_fp32.clone()
+
+            # mlp_fc2
+            mlp_fc2_fp32 = self.mlp_fc2.forward(mlp_act_fp32)
+            fp32_activations['mlp_fc2'] = mlp_fc2_fp32.clone()
+
+            # mlp_act2
+            mlp_act2_fp32 = self.mlp_act2.forward(mlp_fc2_fp32)
+            fp32_activations['mlp_act2'] = mlp_act2_fp32.clone()
+
+            # residual2
+            x_res2_fp32 = residual1_fp32 + self.drop_path2(mlp_act2_fp32)
+            residual2_fp32 = self.residual2.forward(x_res2_fp32)
+            fp32_activations['residual2'] = residual2_fp32.clone()
+
+            # === Quantized Mode ===
+            self.set_mode('quantized')
+            quant_activations = {}
+
+            # norm1
+            x_norm1_quant = self.norm1.forward(test_input)
+            quant_activations['norm1'] = x_norm1_quant.clone()
+
+            # attn_qkv
+            qkv_quant = self.attn_qkv.forward(x_norm1_quant)
+            quant_activations['attn_qkv'] = qkv_quant.clone()
+
+            # attn_qkv_output
+            qkv_out_quant = self.attn_qkv_output.forward(qkv_quant)
+            quant_activations['attn_qkv_output'] = qkv_out_quant.clone()
+
+            qkv_quant = qkv_out_quant.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv_quant.unbind(0)
+
+            # kv_act
+            attn_quant = (q @ k.transpose(-2, -1)) * self.scale
+            kv_act_quant = self.kv_act.forward(attn_quant)
+            quant_activations['kv_act'] = kv_act_quant.clone()
+
+            # intSoft
+            scale_param = self.kv_act.scaler if hasattr(self.kv_act, 'scaler') else None
+            intsoft_quant = self.intSoft.forward(kv_act_quant, scale=scale_param)
+            quant_activations['intSoft'] = intsoft_quant.clone()
+
+            intsoft_quant = self.attn_drop(intsoft_quant)
+
+            # attn_proj
+            x_attn_quant = (intsoft_quant @ v).transpose(1, 2).reshape(B, N, C)
+            attn_proj_quant = self.attn_proj.forward(x_attn_quant)
+            quant_activations['attn_proj'] = attn_proj_quant.clone()
+
+            # sv_attn
+            sv_attn_quant = self.sv_attn.forward(attn_proj_quant)
+            quant_activations['sv_attn'] = sv_attn_quant.clone()
+
+            sv_attn_quant = self.proj_drop(sv_attn_quant)
+
+            # residual1
+            x_res1_quant = test_input + self.drop_path1(sv_attn_quant)
+            residual1_quant = self.residual1.forward(x_res1_quant)
+            quant_activations['residual1'] = residual1_quant.clone()
+
+            # norm2
+            x_norm2_quant = self.norm2.forward(residual1_quant)
+            quant_activations['norm2'] = x_norm2_quant.clone()
+
+            # mlp_fc1
+            mlp_fc1_quant = self.mlp_fc1.forward(x_norm2_quant)
+            quant_activations['mlp_fc1'] = mlp_fc1_quant.clone()
+
+            # mlp_act
+            mlp_act_quant = self.mlp_act.forward(mlp_fc1_quant)
+            quant_activations['mlp_act'] = mlp_act_quant.clone()
+
+            # mlp_fc2
+            mlp_fc2_quant = self.mlp_fc2.forward(mlp_act_quant)
+            quant_activations['mlp_fc2'] = mlp_fc2_quant.clone()
+
+            # mlp_act2
+            mlp_act2_quant = self.mlp_act2.forward(mlp_fc2_quant)
+            quant_activations['mlp_act2'] = mlp_act2_quant.clone()
+
+            # residual2
+            x_res2_quant = residual1_quant + self.drop_path2(mlp_act2_quant)
+            residual2_quant = self.residual2.forward(x_res2_quant)
+            quant_activations['residual2'] = residual2_quant.clone()
+
+        # Update profilers (activation layers only - weights already done)
+        activation_layers = [
+            'norm1', 'attn_qkv_output', 'kv_act', 'intSoft', 'sv_attn',
+            'residual1', 'norm2', 'mlp_act', 'mlp_act2', 'residual2'
+        ]
+
+        for layer_name in activation_layers:
+            if layer_name in fp32_activations and layer_name in quant_activations:
+                self.profilers[layer_name].update_weight(
+                    fp32_activations[layer_name],
+                    quant_activations[layer_name]
+                )
+
+    def save_profiling_report(self, log_dir: Union[str, Path] = None):
+        """
+        Save profiling statistics report to txt file.
+
+        Args:
+            log_dir: Directory to save log files. Creates 'log' folder at project root if None.
+        """
+        if not self.enable_profiling:
+            print("Profiling is not enabled")
+            return
+
+        # Create log directory
+        if log_dir is None:
+            log_dir = Path(__file__).parent.parent / 'log'
+        else:
+            log_dir = Path(log_dir)
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = log_dir / f"profiling_report_{timestamp}.txt"
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append("ViT Block Quantization Profiling Report")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 80)
+
+        # Layer categories
+        weight_layers = ['attn_qkv', 'attn_proj', 'mlp_fc1', 'mlp_fc2']
+        activation_layers = [
+            'norm1', 'attn_qkv_output', 'kv_act', 'intSoft', 'sv_attn',
+            'residual1', 'norm2', 'mlp_act', 'mlp_act2', 'residual2'
+        ]
+
+        # Weight layers statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("WEIGHT QUANTIZATION STATISTICS")
+        lines.append("=" * 80)
+
+        for layer_name in weight_layers:
+            if layer_name not in self.profilers:
+                continue
+
+            try:
+                stats = self.profilers[layer_name].get_statistic()
+                hist = self.profilers[layer_name].get_hist()
+
+                lines.append(f"\n[{layer_name}]")
+                lines.append("-" * 40)
+
+                mse = stats.get('mse', None)
+                lines.append(f"  MSE:               {mse:.10f}" if mse is not None else "  MSE:               N/A")
+
+                sqnr = stats.get('qsnr', None)
+                lines.append(f"  SQNR:              {sqnr:.4f} dB" if sqnr is not None else "  SQNR:              N/A")
+
+                cos_sim = stats.get('cosine_sim', None)
+                lines.append(f"  Cosine Similarity: {cos_sim:.10f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+
+                kl_div = hist.get('kl_divergence', None)
+                lines.append(f"  KL Divergence:     {kl_div:.10f}" if kl_div is not None else "  KL Divergence:     N/A")
+
+                js_div = hist.get('js_divergence', None)
+                lines.append(f"  JS Divergence:     {js_div:.10f}" if js_div is not None else "  JS Divergence:     N/A")
+
+                orig_range = hist.get('original_range', (None, None))
+                lines.append(f"  FP32 Range:        [{orig_range[0]:.6f}, {orig_range[1]:.6f}]" if orig_range[0] is not None else "  FP32 Range:        N/A")
+
+                quant_range = hist.get('quantized_range', (None, None))
+                lines.append(f"  Quant Range:       [{quant_range[0]:.6f}, {quant_range[1]:.6f}]" if quant_range[0] is not None else "  Quant Range:       N/A")
+
+            except Exception as e:
+                lines.append(f"\n[{layer_name}]")
+                lines.append(f"  Error: {str(e)}")
+
+        # Activation layers statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("ACTIVATION QUANTIZATION STATISTICS")
+        lines.append("=" * 80)
+
+        for layer_name in activation_layers:
+            if layer_name not in self.profilers:
+                continue
+
+            try:
+                stats = self.profilers[layer_name].get_statistic()
+                hist = self.profilers[layer_name].get_hist()
+
+                lines.append(f"\n[{layer_name}]")
+                lines.append("-" * 40)
+
+                mse = stats.get('mse', None)
+                lines.append(f"  MSE:               {mse:.10f}" if mse is not None else "  MSE:               N/A")
+
+                sqnr = stats.get('qsnr', None)
+                lines.append(f"  SQNR:              {sqnr:.4f} dB" if sqnr is not None else "  SQNR:              N/A")
+
+                cos_sim = stats.get('cosine_sim', None)
+                lines.append(f"  Cosine Similarity: {cos_sim:.10f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+
+                kl_div = hist.get('kl_divergence', None)
+                lines.append(f"  KL Divergence:     {kl_div:.10f}" if kl_div is not None else "  KL Divergence:     N/A")
+
+                js_div = hist.get('js_divergence', None)
+                lines.append(f"  JS Divergence:     {js_div:.10f}" if js_div is not None else "  JS Divergence:     N/A")
+
+                orig_range = hist.get('original_range', (None, None))
+                lines.append(f"  FP32 Range:        [{orig_range[0]:.6f}, {orig_range[1]:.6f}]" if orig_range[0] is not None else "  FP32 Range:        N/A")
+
+                quant_range = hist.get('quantized_range', (None, None))
+                lines.append(f"  Quant Range:       [{quant_range[0]:.6f}, {quant_range[1]:.6f}]" if quant_range[0] is not None else "  Quant Range:       N/A")
+
+            except Exception as e:
+                lines.append(f"\n[{layer_name}]")
+                lines.append(f"  Error: {str(e)}")
+
+        # Summary statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("SUMMARY")
+        lines.append("=" * 80)
+
+        try:
+            all_layers = weight_layers + activation_layers
+            valid_sqnr = []
+            valid_kl = []
+
+            for layer_name in all_layers:
+                if layer_name in self.profilers:
+                    try:
+                        stats = self.profilers[layer_name].get_statistic()
+                        hist = self.profilers[layer_name].get_hist()
+                        sqnr = stats.get('qsnr', None)
+                        kl = hist.get('kl_divergence', None)
+                        if sqnr is not None:
+                            valid_sqnr.append((layer_name, sqnr))
+                        if kl is not None:
+                            valid_kl.append((layer_name, kl))
+                    except:
+                        pass
+
+            if valid_sqnr:
+                avg_sqnr = sum(s[1] for s in valid_sqnr) / len(valid_sqnr)
+                min_sqnr = min(valid_sqnr, key=lambda x: x[1])
+                max_sqnr = max(valid_sqnr, key=lambda x: x[1])
+
+                lines.append(f"\n  Average SQNR:      {avg_sqnr:.4f} dB")
+                lines.append(f"  Best SQNR:         {max_sqnr[0]} ({max_sqnr[1]:.4f} dB)")
+                lines.append(f"  Worst SQNR:        {min_sqnr[0]} ({min_sqnr[1]:.4f} dB)")
+
+            if valid_kl:
+                avg_kl = sum(k[1] for k in valid_kl) / len(valid_kl)
+                min_kl = min(valid_kl, key=lambda x: x[1])
+                max_kl = max(valid_kl, key=lambda x: x[1])
+
+                lines.append(f"\n  Average KL Div:    {avg_kl:.6f}")
+                lines.append(f"  Best KL Div:       {min_kl[0]} ({min_kl[1]:.6f})")
+                lines.append(f"  Worst KL Div:      {max_kl[0]} ({max_kl[1]:.6f})")
+
+        except Exception as e:
+            lines.append(f"\n  Summary Error: {str(e)}")
+
+        lines.append("\n" + "=" * 80)
+        lines.append("END OF REPORT")
+        lines.append("=" * 80)
+
+        # Write to file
+        with open(report_path, 'w') as f:
+            f.write('\n'.join(lines))
+
+        print(f"Profiling report saved to: {report_path}")
+        return report_path
+
+    def save_all_histograms(self, log_dir: Union[str, Path] = None):
+        """
+        Save histogram comparison plots for all layers as JPEG files.
+
+        Args:
+            log_dir: Directory to save histogram images. Creates 'log' folder at project root if None.
+        """
+        if not self.enable_profiling:
+            print("Profiling is not enabled")
+            return
+
+        # Create log directory
+        if log_dir is None:
+            log_dir = Path(__file__).parent.parent / 'log'
+        else:
+            log_dir = Path(log_dir)
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate timestamp for filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        all_layers = list(self.profilers.keys())
+        saved_files = []
+
+        for layer_name in all_layers:
+            try:
+                hist_data = self.profilers[layer_name].get_hist()
+                stats = self.profilers[layer_name].get_statistic()
+
+                orig_hist = hist_data['original_hist'].numpy()
+                quant_hist = hist_data['quantized_hist'].numpy()
+                orig_range = hist_data['original_range']
+                quant_range = hist_data['quantized_range']
+
+                # Normalize histograms
+                orig_hist_norm = orig_hist / (orig_hist.sum() + 1e-10)
+                quant_hist_norm = quant_hist / (quant_hist.sum() + 1e-10)
+
+                # Create bin edges
+                min_val = min(orig_range[0], quant_range[0])
+                max_val = max(orig_range[1], quant_range[1])
+                bins = np.linspace(min_val, max_val, len(orig_hist) + 1)
+                bin_centers = (bins[:-1] + bins[1:]) / 2
+
+                # Create figure
+                fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+
+                ax.bar(bin_centers, orig_hist_norm, width=(bins[1]-bins[0])*0.8,
+                       alpha=0.6, label='FP32', color='blue')
+                ax.bar(bin_centers, quant_hist_norm, width=(bins[1]-bins[0])*0.8,
+                       alpha=0.6, label='Quantized', color='red')
+
+                # Statistics text
+                kl_div = hist_data.get('kl_divergence', 0)
+                js_div = hist_data.get('js_divergence', 0)
+                sqnr = stats.get('qsnr', 0)
+                mse = stats.get('mse', 0)
+                cos_sim = stats.get('cosine_sim', 0)
+
+                stats_text = (
+                    f"MSE: {mse:.6f}\n"
+                    f"SQNR: {sqnr:.2f} dB\n"
+                    f"Cosine Sim: {cos_sim:.6f}\n"
+                    f"KL Div: {kl_div:.6f}\n"
+                    f"JS Div: {js_div:.6f}"
+                )
+
+                ax.text(0.98, 0.97, stats_text, transform=ax.transAxes,
+                       verticalalignment='top', horizontalalignment='right',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                       fontsize=10, family='monospace')
+
+                ax.set_xlabel('Value', fontsize=12)
+                ax.set_ylabel('Probability Density', fontsize=12)
+                ax.set_title(f'{layer_name} - FP32 vs Quantized Distribution', fontsize=14)
+                ax.legend(loc='upper left', fontsize=10)
+                ax.grid(True, alpha=0.3)
+                ax.set_yscale('log')
+
+                plt.tight_layout()
+
+                # Save as JPEG
+                save_path = log_dir / f"hist_{layer_name}_{timestamp}.jpg"
+                plt.savefig(save_path, format='jpeg', dpi=150, bbox_inches='tight')
+                plt.close()
+
+                saved_files.append(save_path)
+
+            except Exception as e:
+                print(f"  Warning: Could not save histogram for {layer_name}: {str(e)}")
+                continue
+
+        print(f"Saved {len(saved_files)} histogram images to: {log_dir}")
+        return saved_files
+
+
+def test_vit_block(config_path: Union[str, Path] = None, save_logs: bool = True):
     """
     ViT Block 양자화 테스트
     - Config를 YAML 파일에서 로드
+    - 모든 레이어의 프로파일링 결과를 log 폴더에 저장
 
     Args:
         config_path: YAML config 파일 경로. None이면 기본 int8 config 사용
+        save_logs: True이면 log 폴더에 통계 txt와 히스토그램 jpeg 저장
     """
     print("=" * 80)
     print("ViT Block Quantization Test")
@@ -764,87 +1217,34 @@ def test_vit_block(config_path: Union[str, Path] = None):
     print("\n[Quantized Mode - Profiling Results]")
     quant_block.print_profiling_summary()
 
-    # Weight 통계 분석
+    # ========== 8. 모든 레이어 통계 업데이트 ==========
     print(f"\n{'='*80}")
-    print("Weight Statistics Analysis")
+    print("Updating All Layer Statistics (FP32 vs Quantized)")
     print("="*80)
 
-    quant_block.update_profiler_weights()
+    quant_block.update_all_layer_stats(test_input)
+    print("  All layer statistics updated successfully!")
 
-    linear_layers = ['attn_qkv', 'attn_proj', 'mlp_fc1', 'mlp_fc2']
-    for layer_name in linear_layers:
-        try:
-            stats = quant_block.get_layer_statistics(layer_name)
-            hist = quant_block.profilers[layer_name].get_hist()
-            if stats:
-                print(f"\n[{layer_name}]")
+    # ========== 9. 로그 저장 ==========
+    if save_logs:
+        print(f"\n{'='*80}")
+        print("Saving Profiling Logs")
+        print("="*80)
 
-                # MSE
-                mse = stats.get('mse', None)
-                print(f"  MSE: {mse:.6f}" if mse is not None else "  MSE: N/A")
+        # log 폴더 경로
+        log_dir = Path(__file__).parent.parent / 'log'
 
-                # SQNR
-                sqnr = stats.get('qsnr', None)
-                print(f"  SQNR: {sqnr:.2f} dB" if sqnr is not None else "  SQNR: N/A")
+        # 통계 리포트 저장 (txt)
+        report_path = quant_block.save_profiling_report(log_dir)
 
-                # Cosine Similarity
-                cos_sim = stats.get('cosine_sim', None)
-                print(f"  Cosine Similarity: {cos_sim:.6f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+        # 히스토그램 저장 (jpeg)
+        histogram_files = quant_block.save_all_histograms(log_dir)
 
-                # KL Divergence
-                kl_div = hist.get('kl_divergence', None)
-                print(f"  KL Divergence: {kl_div:.6f}" if kl_div is not None else "  KL Divergence: N/A")
+        print(f"\n  Log directory: {log_dir}")
+        print(f"  Report file: {report_path}")
+        print(f"  Histogram files: {len(histogram_files)} images saved")
 
-                # JS Divergence
-                js_div = hist.get('js_divergence', None)
-                print(f"  JS Divergence: {js_div:.6f}" if js_div is not None else "  JS Divergence: N/A")
-        except Exception as e:
-            print(f"\n[{layer_name}] - Could not compute statistics: {str(e)}")
-
-    # Activation 통계 분석 (kv_act, sv_attn)
-    print(f"\n{'='*80}")
-    print("Activation Statistics Analysis")
-    print("="*80)
-
-    quant_block.update_activation_stats(test_input)
-
-    activation_layers = ['kv_act', 'sv_attn']
-    for layer_name in activation_layers:
-        try:
-            stats = quant_block.get_layer_statistics(layer_name)
-            hist = quant_block.profilers[layer_name].get_hist()
-            if stats:
-                print(f"\n[{layer_name}]")
-
-                # MSE
-                mse = stats.get('mse', None)
-                print(f"  MSE: {mse:.6f}" if mse is not None else "  MSE: N/A")
-
-                # SQNR
-                sqnr = stats.get('qsnr', None)
-                print(f"  SQNR: {sqnr:.2f} dB" if sqnr is not None else "  SQNR: N/A")
-
-                # Cosine Similarity
-                cos_sim = stats.get('cosine_sim', None)
-                print(f"  Cosine Similarity: {cos_sim:.6f}" if cos_sim is not None else "  Cosine Similarity: N/A")
-
-                # KL Divergence
-                kl_div = hist.get('kl_divergence', None)
-                print(f"  KL Divergence: {kl_div:.6f}" if kl_div is not None else "  KL Divergence: N/A")
-
-                # JS Divergence
-                js_div = hist.get('js_divergence', None)
-                print(f"  JS Divergence: {js_div:.6f}" if js_div is not None else "  JS Divergence: N/A")
-        except Exception as e:
-            print(f"\n[{layer_name}] - Could not compute statistics: {str(e)}")
-
-    # 히스토그램 시각화
-    print(f"\n{'='*80}")
-    print("Generating Activation Histogram Plots")
-    print("="*80)
-    quant_block.plot_activation_histograms(['kv_act', 'sv_attn'])
-
-    # ========== 8. Error Analysis ==========
+    # ========== 10. Error Analysis ==========
     print(f"\n{'='*80}")
     print("Error Analysis (FP32 vs Quantized Output)")
     print("="*80)
@@ -855,6 +1255,7 @@ def test_vit_block(config_path: Union[str, Path] = None):
 
     # Per-layer weight quantization quality summary
     print("\n[Per-Layer Weight Quality Summary]")
+    linear_layers = ['attn_qkv', 'attn_proj', 'mlp_fc1', 'mlp_fc2']
     total_layers = len(linear_layers)
     avg_sqnr = sum([quant_block.get_layer_statistics(name).get('qsnr', 0) for name in linear_layers]) / total_layers
     avg_kl = sum([quant_block.profilers[name].get_hist().get('kl_divergence', 0) for name in linear_layers]) / total_layers
@@ -890,21 +1291,24 @@ def test_vit_block(config_path: Union[str, Path] = None):
     rel_error = ((output_fp32 - output_quant).abs() / (output_fp32.abs() + 1e-8)).mean()
     print(f"  Mean Relative Error: {rel_error.item():.6f}")
 
-    # ========== 9. Success Check ==========
+    # ========== 11. Success Check ==========
     print(f"\n{'='*80}")
     if cos_sim > 0.99 and qsnr > 30:
-        print("✅ ViT Block Quantization Test PASSED!")
+        print("ViT Block Quantization Test PASSED!")
         print(f"   - Cosine Similarity: {cos_sim.item():.6f} (> 0.99)")
         print(f"   - QSNR: {qsnr.item():.2f} dB (> 30 dB)")
     elif cos_sim > 0.95:
-        print("⚠️  ViT Block Quantization Test: Acceptable Quality")
+        print("ViT Block Quantization Test: Acceptable Quality")
         print(f"   - Cosine Similarity: {cos_sim.item():.6f}")
         print(f"   - QSNR: {qsnr.item():.2f} dB")
     else:
-        print("❌ ViT Block Quantization Test: Low Quality")
+        print("ViT Block Quantization Test: Low Quality")
         print(f"   - Cosine Similarity: {cos_sim.item():.6f}")
         print(f"   - QSNR: {qsnr.item():.2f} dB")
     print("="*80)
+
+    if save_logs:
+        print(f"\nProfiling results saved to: {log_dir}")
 
 
 if __name__ == "__main__":

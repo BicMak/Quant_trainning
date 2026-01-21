@@ -27,8 +27,8 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
-    percentile_sigma: 0.01
+    percentile_alpha: 0.99
+    percentile_sigma: 0.05
 
   # Attention output projection
   attn_proj:
@@ -39,8 +39,8 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
-    percentile_sigma: 0.01
+    percentile_alpha: 0.995
+    percentile_sigma: 0.1
 
   # MLP first linear layer (expansion)
   mlp_fc1:
@@ -51,8 +51,8 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
-    percentile_sigma: 0.01
+    percentile_alpha: 0.999
+    percentile_sigma: 0.2
 
   # MLP second linear layer (projection)
   mlp_fc2:
@@ -63,8 +63,8 @@ layers:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.95
-    percentile_sigma: 0.01
+    percentile_alpha: 0.999
+    percentile_sigma: 0.2
 
   # LayerNorm 1 (before attention)
   norm1:
@@ -100,10 +100,10 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: OmseObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
-    percentile_sigma: 0.0001
+    percentile_sigma: 0.1
 
   # Key-Value activation (after split)
   kv_act:
@@ -112,10 +112,10 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: OmseObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.9995
-    percentile_sigma: 0.0001
+    percentile_alpha: 0.99
+    percentile_sigma: 0.2
 
 
   # Softmax-Value attention output
@@ -125,10 +125,10 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: OmseObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.9995
-    percentile_sigma: 0.0001
+    percentile_alpha: 0.99
+    percentile_sigma: 0.2
 
 
   # MLP first activation (after GELU)
@@ -138,10 +138,10 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: OmseObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
-    percentile_sigma: 0.01
+    percentile_alpha: 0.99999
+    percentile_sigma: 0.2
 
   # MLP second activation (if exists)
   mlp_act2:
@@ -150,10 +150,10 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: OmseObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
-    percentile_sigma: 0.01
+    percentile_alpha: 0.99999
+    percentile_sigma: 0.2
 
   # IntSoftmax quantization
   intSoft:
@@ -162,7 +162,7 @@ attn_layer:
       bits: 8
       signed: true
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
     percentile_alpha: 0.99
     percentile_sigma: 0.01
@@ -191,7 +191,7 @@ residual_layer:
       name: int8
     observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
+    percentile_alpha: 0.98
     percentile_sigma: 0.01
 
 # ==================== Advanced Configuration Examples ====================

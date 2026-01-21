@@ -63,7 +63,6 @@ class OmseObserver(BaseObserver):
         search_iterations = 100
         keep_ratios = torch.logspace(0, -4, steps=search_iterations).to(device)
         
-        # Grid search (90 iterations)
         for keep_ratio in keep_ratios:
 
             new_max = max_val * keep_ratio
