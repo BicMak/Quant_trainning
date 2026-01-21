@@ -13,7 +13,7 @@ from layer_observer.kv_divergence import KVObserver
 from layer_observer.bit_type import BitType
 import os
 
-import observer_config
+import quant_config
 
 ACTIVATION_MAP = {
     nn.ReLU: F.relu,

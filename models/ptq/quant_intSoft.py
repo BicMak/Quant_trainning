@@ -1,29 +1,25 @@
 import torch
 import torch.nn as nn
 
-from .observer_config import QuantConfig, BitTypeConfig
+from ...quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
-
-
-
 
 class QuantIntSoft(nn.Module):
 
     def __init__(self, 
-                 quant_args:dict,
                  input_module:nn.Module,
-                 observer_config:QuantConfig):
+                 quant_config:QuantConfig):
         super(QuantIntSoft, self).__init__()
 
         #0. observer config copy
-        self.observer_config = observer_config
-        self.observer_type = observer_config.observer_type
+        self.observer_config = quant_config
+        self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
-            bits=observer_config.bit_type.bits,
-            signed=observer_config.bit_type.signed,
-            name=observer_config.bit_type.name
+            bits=quant_config.bit_type.bits,
+            signed=quant_config.bit_type.signed,
+            name=quant_config.bit_type.name
         )
-        self.calibration_mode = observer_config.calibration_mode
+        self.calibration_mode = quant_config.calibration_mode
         self.mode = 'fp32'
 
 
@@ -150,7 +146,7 @@ def main():
 
     # 1. Observer co    nfig 생성
     bit_type_config = BitTypeConfig(bits=8, signed=False, name='uint8')
-    observer_config = QuantConfig(
+    observer_config = ObserverConfig(
         observer_type='PercentileObserver',
         bit_type=bit_type_config,
         calibration_mode='layer_wise'
@@ -259,7 +255,7 @@ def test_full_attention_pipeline(observer_type='PercentileObserver'):
 
     # ========== 1. Config 설정 ==========
     bit_type_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
+    observer_config = ObserverConfig(
         observer_type=observer_type,
         bit_type=bit_type_config,
         calibration_mode='layer_wise'

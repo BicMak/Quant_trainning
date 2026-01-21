@@ -6,30 +6,27 @@ import copy
 from torch import Tensor
 import os
 
-from .observer_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
 
-# observer_config를 받아서 QuantLayer 구성
 class QLayerNorm(nn.Module):
-    def __init__(self, 
-                 quant_args:dict,
-                 input_module:nn.Module,
-                 observer_config:QuantConfig):
-        # observer 초기화
-        super(QLayerNorm, self).__init__()
+    def __init__(self,
+                 input_module: nn.Module,
+                 quant_config: QuantConfig):
+        super().__init__()
 
-        #0. observer config copy
+        # quant_config에서 설정 추출
         self.input_module = input_module
-        self.observer_config = observer_config
-        self.observer_type = observer_config.observer_type
+        self.quant_config = quant_config
+        self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
-            bits=observer_config.bit_type.bits,
-            signed=observer_config.bit_type.signed,
-            name=observer_config.bit_type.name
+            bits=quant_config.bit_type.bits,
+            signed=quant_config.bit_type.signed,
+            name=quant_config.bit_type.name
         )
-        self.calibration_mode = observer_config.calibration_mode
+        self.calibration_mode = quant_config.calibration_mode
         self.quant_weight = None
         self.mode = 'fp32'
 
@@ -48,7 +45,7 @@ class QLayerNorm(nn.Module):
                                         self.bit_type,
                                         'activation',
                                         self.calibration_mode,
-                                        self.observer_config)
+                                        self.quant_config)
 
         #2. quantizer build
         self.output_quantizer = build_quantizer(
@@ -162,7 +159,7 @@ class QLayerNorm(nn.Module):
 def test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
+    quant_config = QuantConfig(
         calibration_mode='channel_wise',
         bit_type=bit_config,
         observer_type=observer_type
@@ -200,9 +197,8 @@ def test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True):
     for name, layer in model.named_modules():
         if isinstance(layer, nn.LayerNorm):
             quant_layer = QLayerNorm(
-                quant_args={},
                 input_module=layer,
-                observer_config=observer_config
+                quant_config=quant_config
             )
             quant_ln_layers[name] = quant_layer
             print(f"Converted: {name}")

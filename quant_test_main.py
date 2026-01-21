@@ -5,7 +5,7 @@ import torchvision.models as models
 import copy
 from torch import Tensor
 
-from models.ptq.observer_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from layer_observer.minmax import MinmaxObserver
 
 from models.ptq.bit_type import BitType

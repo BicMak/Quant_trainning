@@ -20,13 +20,13 @@ ACTIVATION_MAP = {
     nn.Hardswish: F.hardswish,
 }
 
-def init_observers(observer_type, bit_type, 
+def init_observers(observer_type, bit_type,
                    module_type, calibration_mode,
-                   observer_config):
-    #2. observer initialization
+                   quant_config):
+    """Observer 초기화 함수"""
     if observer_type == 'MinmaxObserver':
         observer = MinmaxObserver(
-            bit_type=bit_type, 
+            bit_type=bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode
         )
@@ -35,8 +35,8 @@ def init_observers(observer_type, bit_type,
             bit_type=bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode,
-            percentile_alpha=observer_config.percentile_alpha,
-            percentile_sigma=observer_config.percentile_sigma
+            percentile_alpha=quant_config.percentile_alpha,
+            percentile_sigma=quant_config.percentile_sigma
         )
     elif observer_type == 'OmseObserver':
         observer = OmseObserver(
@@ -49,7 +49,7 @@ def init_observers(observer_type, bit_type,
             bit_type=bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode,
-            hist_bins=observer_config.kv_bins
+            hist_bins=quant_config.kv_bins
         )
 
     return observer

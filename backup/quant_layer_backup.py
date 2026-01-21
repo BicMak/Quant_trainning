@@ -5,7 +5,7 @@ import torchvision.models as models
 import copy
 from torch import Tensor
 
-from models.ptq.observer_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from layer_observer.minmax import MinmaxObserver
 from layer_observer.percentile import PercentileObserver
 from layer_observer.omse import OmseObserver
@@ -13,7 +13,7 @@ from layer_observer.kv_divergence import KVObserver
 from models.ptq.bit_type import BitType
 import os
 
-import models.ptq.observer_config as observer_config
+import quant_config
 
 ACTIVATION_MAP = {
     nn.ReLU: F.relu,

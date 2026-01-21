@@ -6,30 +6,28 @@ import copy
 from torch import Tensor
 import os
 
-from .observer_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
 
-# observer_config를 받아서 QuantLayer 구성
 class QuantLinear(nn.Module):
-    def __init__(self, 
-                 quant_args:dict,
-                 input_module:nn.Module,
-                 observer_config:QuantConfig):
-        # observer 초기화
-        super(QuantLinear, self).__init__()
+    def __init__(self,
+                 input_module: nn.Module,
+                 quant_config: QuantConfig,
+                 ):
+        super().__init__()
 
-        #0. observer config copy
+        # quant_config에서 설정 추출
         self.input_module = input_module
-        self.observer_config = observer_config
-        self.observer_type = observer_config.observer_type
+        self.quant_config = quant_config
+        self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
-            bits=observer_config.bit_type.bits,
-            signed=observer_config.bit_type.signed,
-            name=observer_config.bit_type.name
+            bits=quant_config.bit_type.bits,
+            signed=quant_config.bit_type.signed,
+            name=quant_config.bit_type.name
         )
-        self.calibration_mode = observer_config.calibration_mode
+        self.calibration_mode = quant_config.calibration_mode
         self.quant_weight = None
         self.mode = 'fp32'
 
@@ -39,7 +37,7 @@ class QuantLinear(nn.Module):
                                         self.bit_type,
                                         'linear_weight',
                                         self.calibration_mode,
-                                        self.observer_config)
+                                        self.quant_config)
         self.output_observer = copy.deepcopy(self.observer) #deepcopy for output observer
 
         #2. quantizer build
@@ -119,7 +117,7 @@ class QuantLinear(nn.Module):
 def test_quant_linear(observer_type='PercentileObserver'):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
+    quant_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type=observer_type
@@ -129,16 +127,16 @@ def test_quant_linear(observer_type='PercentileObserver'):
     class SimpleMLP(nn.Module):
         def __init__(self):
             super().__init__()
-            self.fc1 = nn.Linear(784, 512)
-            self.fc2 = nn.Linear(512, 256)
-            self.fc3 = nn.Linear(256, 128)
-            self.fc4 = nn.Linear(128, 10)
+            self.fc1 = nn.Linear(784, 784)
+            self.fc2 = nn.Linear(784, 784)
+            self.fc3 = nn.Linear(784, 784)
+            self.fc4 = nn.Linear(784, 784)
             
         def forward(self, x):
-            x = self.fc1(x)
-            x = self.fc2(x)
-            x = self.fc3(x)
-            x = self.fc4(x)
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            x = F.relu(self.fc3(x))
+            x = F.relu(self.fc4(x))
             return x
     
     mlp = SimpleMLP()
@@ -155,9 +153,8 @@ def test_quant_linear(observer_type='PercentileObserver'):
     for name, layer in mlp.named_modules():
         if isinstance(layer, nn.Linear):
             quant_layer = QuantLinear(
-                quant_args={},
                 input_module=layer,
-                observer_config=observer_config
+                quant_config=quant_config
             )
             quant_layers.append(quant_layer)
             print(f"Converted: {name}")
@@ -248,7 +245,7 @@ def test_with_profiler():
 
     # 1. Config 설정
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
+    quant_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type='PercentileObserver'
@@ -270,9 +267,8 @@ def test_with_profiler():
     for name, layer in mlp.named_modules():
         if isinstance(layer, nn.Linear):
             quant_layers[name] = QuantLinear(
-                quant_args={},
                 input_module=layer,
-                observer_config=observer_config
+                quant_config=quant_config
             )
 
     print(f"Converted {len(quant_layers)} layers: {list(quant_layers.keys())}")

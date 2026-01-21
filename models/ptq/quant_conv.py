@@ -2,50 +2,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-import copy
 from torch import Tensor
 import os
 
-from .observer_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
 
-# observer_config를 받아서 QuantLayer 구성
+
 class QuantConv2d(nn.Module):
     def __init__(self,
-                 quant_args:dict,
-                 input_module:nn.Conv2d,
-                 observer_config:QuantConfig):
-        super(QuantConv2d, self).__init__()
+                 input_module: nn.Conv2d,
+                 quant_config: QuantConfig):
+        super().__init__()
 
-        #0. observer config copy
+        # quant_config에서 설정 추출
         self.input_module = input_module
-        self.observer_config = observer_config
-        self.observer_type = observer_config.observer_type
+        self.quant_config = quant_config
+        self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
-            bits=observer_config.bit_type.bits,
-            signed=observer_config.bit_type.signed,
-            name=observer_config.bit_type.name
+            bits=quant_config.bit_type.bits,
+            signed=quant_config.bit_type.signed,
+            name=quant_config.bit_type.name
         )
-        self.calibration_mode = observer_config.calibration_mode
+        self.calibration_mode = quant_config.calibration_mode
         self.quant_weight = None
         self.mode = 'fp32'
 
-        #1. set layer type & observer
+        #1. set layer type & observer (weight only)
         self.observer = init_observers(self.observer_type,
                                         self.bit_type,
                                         'conv_weight',
                                         self.calibration_mode,
-                                        self.observer_config)
-        self.output_observer = copy.deepcopy(self.observer)
+                                        self.quant_config)
 
-        #2. quantizer build
+        #2. quantizer build (weight only)
         self.quantizer = build_quantizer(
             quantizer_str='uniform',
             bit_type=self.bit_type,
             module_type='conv_weight')
-        self.output_quantizer = copy.deepcopy(self.quantizer)
 
         #3. layer initialization
         self.fwd_kwargs = dict(
@@ -57,35 +53,30 @@ class QuantConv2d(nn.Module):
         self.fwd_func = F.conv2d
 
         self.weight = self.input_module.weight.clone().detach()
-        if self.input_module.bias != None:
+        if self.input_module.bias is not None:
             self.bias = self.input_module.bias.clone().detach()
         else:
             self.bias = torch.zeros(self.input_module.weight.size(0)).to(
                 self.input_module.weight.device
             )
-    
+
     def calibration(self, x):
-        """Calibration 전용 - observer update만 수행"""
+        """Calibration 전용 - weight observer update만 수행"""
         with torch.no_grad():
             self.observer.update(self.weight)
             output = self.fwd_func(x, self.weight, self.bias, **self.fwd_kwargs)
-            self.output_observer.update(output)
 
-        return output  # 필요하면 반환
+        return output
 
     def compute_quant_params(self):
         """Calibration 끝나고 한 번 호출"""
         self.scaler, self.zero = self.observer.get_quantization_params()
-        self.output_scaler, self.output_zero = self.output_observer.get_quantization_params()
-        
+
         # quantizer에 quantization param 설정
         self.quantizer.update_quantization_params(
             self.scaler, self.zero
-            )
-        self.output_quantizer.update_quantization_params(
-            self.output_scaler, self.output_zero
-            )   
-        
+        )
+
         # weight quantization, save quant_weight
         self.quant_weight = torch.clamp(
             torch.round(self.weight / self.scaler) + self.zero,
@@ -93,34 +84,26 @@ class QuantConv2d(nn.Module):
             max=self.bit_type.upper_bound
         )
 
-        return (self.scaler, self.zero), (self.output_scaler, self.output_zero)
+        return (self.scaler, self.zero)
 
 
     def forward(self, x):
-        # in inference x input is int8 tensor
-
         if self.mode == 'quantized':
-            
             # 1. dequantize weights (int8 -> fp32)
             dequant_weight = self.quantizer.forward(self.quant_weight)
 
-            # 2. fake quantization in fp32
-            x = self.fwd_func(x,dequant_weight, self.bias, **self.fwd_kwargs)
-            
-            # 3. Output fake quantization
-            x = self.output_quantizer.forward(x)
-            
-            return x
-        
-        else:  # fp32
-            return self.fwd_func(x, self.weight, self.bias, **self.fwd_kwargs)  
-            
+            # 2. conv operation with dequantized weight
+            x = self.fwd_func(x, dequant_weight, self.bias, **self.fwd_kwargs)
 
+            return x
+
+        else:  # fp32
+            return self.fwd_func(x, self.weight, self.bias, **self.fwd_kwargs)
 
 def test_quant_conv(observer_type='PercentileObserver'):
     # ========== 1. Config 설정 ==========
     bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
+    quant_config = QuantConfig(
         calibration_mode='layer_wise',
         bit_type=bit_config,
         observer_type=observer_type
@@ -156,9 +139,8 @@ def test_quant_conv(observer_type='PercentileObserver'):
     for name, layer in cnn.named_modules():
         if isinstance(layer, nn.Conv2d):
             quant_layer = QuantConv2d(
-                quant_args={},
                 input_module=layer,
-                observer_config=observer_config
+                quant_config=quant_config
             )
             quant_layers.append(quant_layer)
             print(f"Converted: {name}")
@@ -197,18 +179,15 @@ def test_quant_conv(observer_type='PercentileObserver'):
         print(f"  Observer type: {type(layer.observer).__name__}")
         print(f"  Weight min_val: {layer.observer.min_val:.6f}")
         print(f"  Weight max_val: {layer.observer.max_val:.6f}")
-        print(f"  Output min_val: {layer.output_observer.min_val:.6f}")
-        print(f"  Output max_val: {layer.output_observer.max_val:.6f}")
         print(f"  Weight shape: {layer.weight.shape}")
         print(f"  Weight range: [{layer.weight.min().item():.4f}, {layer.weight.max().item():.4f}]")
 
     # ========== 7. Quantization Params 계산 ==========
     print("\n=== Quantization Parameters 계산 ===")
     for i, layer in enumerate(quant_layers):
-        (w_scale, w_zero), (out_scale, out_zero) = layer.compute_quant_params()
+        (w_scale, w_zero) = layer.compute_quant_params()
         print(f"\nLayer {i} (conv{i+1}):")
         print(f"  Weight - scale: {w_scale:.8f}, zero: {w_zero:.2f}")
-        print(f"  Output - scale: {out_scale:.8f}, zero: {out_zero:.2f}")
 
     # ========== 8. FP32 vs Fake Quantization 비교 ==========
     print("\n=== FP32 vs Fake Quantization 출력 비교 ===")
