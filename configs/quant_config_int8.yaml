@@ -1,0 +1,231 @@
+# Quantization Configuration
+# Single file to manage all quantization settings for different layers
+
+# ==================== Global Default Configuration ====================
+# This is the fallback config used when layer-specific config is not provided
+default:
+  calibration_mode: channel_wise  # layer_wise or channel_wise
+  bit_type:
+    bits: 8
+    signed: true
+    name: int8
+  observer_type: PercentileObserver  # MinmaxObserver, PercentileObserver, OmseObserver, KLObserver
+  quantization_method: Uniform  # Uniform or Log2
+  percentile_alpha: 0.95
+  percentile_sigma: 0.01
+  kv_bins: 2048
+
+# ==================== Weight Quantization Configurations ====================
+# Linear layer weight quantization settings
+layers:
+  # Attention QKV projection (Query, Key, Value)
+  attn_qkv:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+  # Attention output projection
+  attn_proj:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+  # MLP first linear layer (expansion)
+  mlp_fc1:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+  # MLP second linear layer (projection)
+  mlp_fc2:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+  # LayerNorm 1 (before attention)
+  norm1:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+  # LayerNorm 2 (before MLP)
+  norm2:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.95
+    percentile_sigma: 0.01
+
+# ==================== Activation Quantization Configurations ====================
+# Activation quantization settings for intermediate outputs
+attn_layer:
+  # QKV output after linear projection
+  attn_qkv_output:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.0001
+
+  # Key-Value activation (after split)
+  kv_act:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.0001
+
+
+  # Softmax-Value attention output
+  sv_attn:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.0001
+
+
+  # MLP first activation (after GELU)
+  mlp_act:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.99
+    percentile_sigma: 0.01
+
+  # MLP second activation (if exists)
+  mlp_act2:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.99
+    percentile_sigma: 0.01
+
+  # IntSoftmax quantization
+  intSoft:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.99
+    percentile_sigma: 0.01
+
+# ==================== Residual Connection Configurations ====================
+# Quantization for residual connections
+residual_layer:
+  # First residual (after attention)
+  residual1:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.99
+    percentile_sigma: 0.01
+
+  # Second residual (after MLP)
+  residual2:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      signed: true
+      name: int8
+    observer_type: PercentileObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.99
+    percentile_sigma: 0.01
+
+# ==================== Advanced Configuration Examples ====================
+# Uncomment and modify sections below for different quantization strategies
+
+# # Mixed precision: INT4 for weights, INT8 for activations
+# mixed_precision:
+#   layers:
+#     attn_qkv:
+#       bit_type:
+#         bits: 4
+#         name: int4
+#       percentile_alpha: 0.99
+#     mlp_fc1:
+#       bit_type:
+#         bits: 4
+#         name: int4
+#       percentile_alpha: 0.99
+
+# # Extreme quantization for specific layers
+# aggressive_quant:
+#   layers:
+#     mlp_fc2:
+#       bit_type:
+#         bits: 4
+#         name: int4
+#       observer_type: OmseObserver
+#       percentile_alpha: 0.999
+
+# # FP-only layers (no quantization)
+# fp_layers:
+#   layers:
+#     attn_qkv:
+#       bit_type:
+#         bits: 16
+#         signed: true
+#         name: fp16

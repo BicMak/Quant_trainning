@@ -1,14 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 
 from .ptq.quant_linear import QuantLinear
 from .ptq.quant_intSoft import QuantIntSoft
 from .ptq.quant_act import QAct
 from .ptq.quant_layernorm import QLayerNorm
 from .ptq.layer_profiler.profiler import profiler
-from quant_config import QuantConfig, BitTypeConfig
+from quant_config import QuantConfig, LayerQuantConfig
+from utils.config_loader import load_config_from_yaml
 
 from torch.nn.modules.container import Sequential
 
@@ -21,85 +25,97 @@ class QuantTimmVitBlock(nn.Module):
 
     def __init__(self,
                  block,  # timm.models.vision_transformer.Block
-                 quant_config: QuantConfig,
+                 quant_config: Union[QuantConfig, LayerQuantConfig, str, Path] = None,
                  enable_profiling: bool = False):
         super().__init__()
 
         self.original_block = block
         self.enable_profiling = enable_profiling
 
+        # Config 처리: YAML 파일 경로, LayerQuantConfig, 또는 단일 QuantConfig
+        if isinstance(quant_config, (str, Path)):
+            # YAML 파일 경로가 주어진 경우
+            layer_config = load_config_from_yaml(quant_config)
+        elif isinstance(quant_config, LayerQuantConfig):
+            # LayerQuantConfig 객체가 주어진 경우
+            layer_config = quant_config
+        elif isinstance(quant_config, QuantConfig):
+            # 단일 QuantConfig가 주어진 경우 (기존 방식)
+            layer_config = LayerQuantConfig(
+                default_config=quant_config,
+                layer_configs={}
+            )
+        else:
+            raise ValueError(
+                "quant_config must be a YAML file path, LayerQuantConfig, or QuantConfig"
+            )
+
         # === Attention 부분 ===
         # timm은 qkv가 하나로 합쳐져 있음 (in_features → 3 * out_features)
         self.attn_qkv = QuantLinear(
             input_module=block.attn.qkv,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('attn_qkv')
         )
         self.attn_qkv_output = QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('attn_qkv_output'),
             act_module=None
         )
         self.attn_proj = QuantLinear(
             input_module=block.attn.proj,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('attn_proj')
         )
 
-        # kv_act: IntSoftmax에 스칼라 scale을 전달해야 하므로 강제로 layer_wise
-        kv_act_config = QuantConfig(
-            calibration_mode='layer_wise',  # 강제로 layer_wise
-            bit_type=quant_config.bit_type,
-            observer_type=quant_config.observer_type,
-            percentile_alpha=quant_config.percentile_alpha,
-            percentile_sigma=quant_config.percentile_sigma
-        )
+        # kv_act: IntSoftmax에 스칼라 scale을 전달해야 하므로 layer_wise 필요
+        # YAML에서 layer_wise로 설정되어 있을 것으로 예상
         self.kv_act = QAct(
-            quant_config=kv_act_config,
+            quant_config=layer_config.get_config('kv_act'),
             act_module=None
         )
         self.sv_attn= QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('sv_attn'),
             act_module=None
         )
         self.residual1= QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('residual1'),
             act_module=None
         )
         self.residual2= QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('residual2'),
             act_module=None
         )
 
         # === MLP 부분 ===
         self.mlp_fc1 = QuantLinear(
             input_module=block.mlp.fc1,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('mlp_fc1')
         )
         self.mlp_act = QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('mlp_act'),
             act_module=block.mlp.act
         )
         self.mlp_fc2 = QuantLinear(
             input_module=block.mlp.fc2,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('mlp_fc2')
         )
         self.mlp_act2 = QAct(
-            quant_config=quant_config,
+            quant_config=layer_config.get_config('mlp_act2'),
             act_module=None
         )
 
         # === LayerNorm ===
         self.norm1 = QLayerNorm(
             input_module=block.norm1,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('norm1')
         )
         self.norm2 = QLayerNorm(
             input_module=block.norm2,
-            quant_config=quant_config
+            quant_config=layer_config.get_config('norm2')
         )
 
         #QintSoftmax
         self.intSoft = QuantIntSoft(
             input_module = None,
-            quant_config = quant_config
+            quant_config = layer_config.get_config('intSoft')
         )
 
 
@@ -423,6 +439,77 @@ class QuantTimmVitBlock(nn.Module):
                         layer.weight
                     )
 
+    def update_activation_stats(self, test_input):
+        """Run forward pass to capture activation statistics for kv_act and sv_attn"""
+        if not self.enable_profiling:
+            return
+
+        # Storage for original and quantized activations
+        self.activation_cache = {}
+
+        with torch.no_grad():
+            B, N, C = test_input.shape
+
+            # === FP32 mode - capture original activations ===
+            self.set_mode('fp32')
+
+            x_norm = self.norm1.forward(test_input)
+            qkv = self.attn_qkv.forward(x_norm)
+            qkv = self.attn_qkv_output.forward(qkv)
+            qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+
+            # kv_act (before softmax)
+            attn_fp32 = (q @ k.transpose(-2, -1)) * self.scale
+            kv_act_fp32 = self.kv_act.forward(attn_fp32)
+            self.activation_cache['kv_act_fp32'] = kv_act_fp32.clone()
+
+            # Continue to get sv_attn
+            scale_param = self.kv_act.scaler if hasattr(self.kv_act, 'scaler') else None
+            attn_fp32 = self.intSoft.forward(kv_act_fp32, scale=scale_param)
+            attn_fp32 = self.attn_drop(attn_fp32)
+            x_attn_fp32 = (attn_fp32 @ v).transpose(1, 2).reshape(B, N, C)
+            x_attn_fp32 = self.attn_proj.forward(x_attn_fp32)
+
+            # sv_attn
+            sv_attn_fp32 = self.sv_attn.forward(x_attn_fp32)
+            self.activation_cache['sv_attn_fp32'] = sv_attn_fp32.clone()
+
+            # === Quantized mode - capture quantized activations ===
+            self.set_mode('quantized')
+
+            x_norm = self.norm1.forward(test_input)
+            qkv = self.attn_qkv.forward(x_norm)
+            qkv = self.attn_qkv_output.forward(qkv)
+            qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+
+            # kv_act (before softmax)
+            attn_quant = (q @ k.transpose(-2, -1)) * self.scale
+            kv_act_quant = self.kv_act.forward(attn_quant)
+            self.activation_cache['kv_act_quant'] = kv_act_quant.clone()
+
+            # Continue to get sv_attn
+            scale_param = self.kv_act.scaler if hasattr(self.kv_act, 'scaler') else None
+            attn_quant = self.intSoft.forward(kv_act_quant, scale=scale_param)
+            attn_quant = self.attn_drop(attn_quant)
+            x_attn_quant = (attn_quant @ v).transpose(1, 2).reshape(B, N, C)
+            x_attn_quant = self.attn_proj.forward(x_attn_quant)
+
+            # sv_attn
+            sv_attn_quant = self.sv_attn.forward(x_attn_quant)
+            self.activation_cache['sv_attn_quant'] = sv_attn_quant.clone()
+
+        # Update profilers with activation data
+        self.profilers['kv_act'].update_weight(
+            self.activation_cache['kv_act_fp32'],
+            self.activation_cache['kv_act_quant']
+        )
+        self.profilers['sv_attn'].update_weight(
+            self.activation_cache['sv_attn_fp32'],
+            self.activation_cache['sv_attn_quant']
+        )
+
     def get_layer_statistics(self, layer_name: str):
         """Get statistical analysis for a specific layer"""
         if not self.enable_profiling:
@@ -433,12 +520,84 @@ class QuantTimmVitBlock(nn.Module):
 
         return self.profilers[layer_name].get_statistic()
 
+    def plot_activation_histograms(self, layer_names=['kv_act', 'sv_attn'], save_path=None):
+        """Plot histogram comparison for specified activation layers"""
+        if not self.enable_profiling:
+            print("Profiling is not enabled")
+            return
 
-def test_vit_block():
+        num_layers = len(layer_names)
+        fig, axes = plt.subplots(num_layers, 1, figsize=(12, 6 * num_layers))
+
+        if num_layers == 1:
+            axes = [axes]
+
+        for idx, layer_name in enumerate(layer_names):
+            if layer_name not in self.profilers:
+                continue
+
+            hist_data = self.profilers[layer_name].get_hist()
+
+            orig_hist = hist_data['original_hist'].numpy()
+            quant_hist = hist_data['quantized_hist'].numpy()
+            orig_range = hist_data['original_range']
+            quant_range = hist_data['quantized_range']
+
+            # Normalize histograms to probability
+            orig_hist_norm = orig_hist / (orig_hist.sum() + 1e-10)
+            quant_hist_norm = quant_hist / (quant_hist.sum() + 1e-10)
+
+            # Create bin edges
+            min_val = min(orig_range[0], quant_range[0])
+            max_val = max(orig_range[1], quant_range[1])
+            bins = np.linspace(min_val, max_val, len(orig_hist) + 1)
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+
+            # Plot
+            ax = axes[idx]
+            ax.bar(bin_centers, orig_hist_norm, width=(bins[1]-bins[0])*0.8,
+                   alpha=0.6, label='FP32', color='blue')
+            ax.bar(bin_centers, quant_hist_norm, width=(bins[1]-bins[0])*0.8,
+                   alpha=0.6, label='Quantized', color='red')
+
+            # Add statistics
+            stats = self.profilers[layer_name].get_statistic()
+            kl_div = hist_data.get('kl_divergence', 0)
+            js_div = hist_data.get('js_divergence', 0)
+            sqnr = stats.get('qsnr', 0)
+
+            stats_text = f"SQNR: {sqnr:.2f} dB\nKL Div: {kl_div:.4f}\nJS Div: {js_div:.4f}"
+            ax.text(0.98, 0.97, stats_text, transform=ax.transAxes,
+                   verticalalignment='top', horizontalalignment='right',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                   fontsize=10)
+
+            ax.set_xlabel('Activation Value')
+            ax.set_ylabel('Probability Density')
+            ax.set_title(f'{layer_name} - Distribution Comparison')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"\nHistogram saved to: {save_path}")
+        else:
+            plt.savefig('activation_histograms.png', dpi=150, bbox_inches='tight')
+            print("\nHistogram saved to: activation_histograms.png")
+
+        plt.close()
+
+
+def test_vit_block(config_path: Union[str, Path] = None):
     """
     ViT Block 양자화 테스트
-    - Observer: PercentileObserver
-    - Bit: 8-bit signed (symmetric)
+    - Config를 YAML 파일에서 로드
+
+    Args:
+        config_path: YAML config 파일 경로. None이면 기본 int8 config 사용
     """
     print("=" * 80)
     print("ViT Block Quantization Test")
@@ -450,18 +609,22 @@ def test_vit_block():
         print("Error: timm library not installed. Install with: pip install timm")
         return
 
-    # ========== 1. Config 설정 (8-bit symmetric, PercentileObserver) ==========
-    bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    quant_config = QuantConfig(
-        calibration_mode='channel_wise',
-        bit_type=bit_config,
-        observer_type='PercentileObserver'
-    )
+    # ========== 1. Config 로드 ==========
+    if config_path is None:
+        # 기본 config 경로 설정
+        config_path = Path(__file__).parent.parent / 'configs' / 'quant_config_int8.yaml'
 
-    print(f"\n[Config]")
-    print(f"  Bit Type: {bit_config.bits}-bit {'signed' if bit_config.signed else 'unsigned'} (symmetric)")
-    print(f"  Observer: {quant_config.observer_type}")
-    print(f"  Calibration Mode: {quant_config.calibration_mode}")
+    print(f"\n[Config Loading]")
+    print(f"  Config file: {config_path}")
+
+    layer_config = load_config_from_yaml(config_path)
+
+    print(f"\n[Config Summary]")
+    print(f"  Default bit type: {layer_config.default_config.bit_type.bits}-bit "
+          f"{'signed' if layer_config.default_config.bit_type.signed else 'unsigned'}")
+    print(f"  Default observer: {layer_config.default_config.observer_type}")
+    print(f"  Default calibration mode: {layer_config.default_config.calibration_mode}")
+    print(f"  Layer-specific configs: {len(layer_config.layer_configs)} layers")
 
     # ========== 2. timm ViT 모델 로드 및 첫 번째 block 추출 ==========
     print(f"\n[Model Loading]")
@@ -479,7 +642,7 @@ def test_vit_block():
     print(f"\n[Quantized Block Creation]")
     quant_block = QuantTimmVitBlock(
         block=original_block,
-        quant_config=quant_config,
+        quant_config=config_path,  # YAML 파일 경로 전달
         enable_profiling=True  # 프로파일링 활성화
     )
     print(f"  QuantTimmVitBlock created successfully")
@@ -637,6 +800,49 @@ def test_vit_block():
                 print(f"  JS Divergence: {js_div:.6f}" if js_div is not None else "  JS Divergence: N/A")
         except Exception as e:
             print(f"\n[{layer_name}] - Could not compute statistics: {str(e)}")
+
+    # Activation 통계 분석 (kv_act, sv_attn)
+    print(f"\n{'='*80}")
+    print("Activation Statistics Analysis")
+    print("="*80)
+
+    quant_block.update_activation_stats(test_input)
+
+    activation_layers = ['kv_act', 'sv_attn']
+    for layer_name in activation_layers:
+        try:
+            stats = quant_block.get_layer_statistics(layer_name)
+            hist = quant_block.profilers[layer_name].get_hist()
+            if stats:
+                print(f"\n[{layer_name}]")
+
+                # MSE
+                mse = stats.get('mse', None)
+                print(f"  MSE: {mse:.6f}" if mse is not None else "  MSE: N/A")
+
+                # SQNR
+                sqnr = stats.get('qsnr', None)
+                print(f"  SQNR: {sqnr:.2f} dB" if sqnr is not None else "  SQNR: N/A")
+
+                # Cosine Similarity
+                cos_sim = stats.get('cosine_sim', None)
+                print(f"  Cosine Similarity: {cos_sim:.6f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+
+                # KL Divergence
+                kl_div = hist.get('kl_divergence', None)
+                print(f"  KL Divergence: {kl_div:.6f}" if kl_div is not None else "  KL Divergence: N/A")
+
+                # JS Divergence
+                js_div = hist.get('js_divergence', None)
+                print(f"  JS Divergence: {js_div:.6f}" if js_div is not None else "  JS Divergence: N/A")
+        except Exception as e:
+            print(f"\n[{layer_name}] - Could not compute statistics: {str(e)}")
+
+    # 히스토그램 시각화
+    print(f"\n{'='*80}")
+    print("Generating Activation Histogram Plots")
+    print("="*80)
+    quant_block.plot_activation_histograms(['kv_act', 'sv_attn'])
 
     # ========== 8. Error Analysis ==========
     print(f"\n{'='*80}")
