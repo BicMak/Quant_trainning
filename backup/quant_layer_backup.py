@@ -9,7 +9,7 @@ from observer_config import ObserverConfig, BitTypeConfig
 from layer_observer.minmax import MinmaxObserver
 from layer_observer.percentile import PercentileObserver
 from layer_observer.omse import OmseObserver
-from layer_observer.kv_divergence import KVObserver
+from layer_observer.kl_divergence import KLObserver
 from models.ptq.bit_type import BitType
 import os
 
@@ -51,11 +51,11 @@ def init_observers(observer_type, bit_type,
             calibration_mode=calibration_mode
         )
     elif observer_type == 'KLObserver':
-        observer = KVObserver(
+        observer = KLObserver(
             bit_type=bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode,
-            kl_bins=observer_config.kl_bins
+            hist_bins=observer_config.kl_bins
         )
 
     return observer
@@ -198,11 +198,11 @@ class QuantLayer(nn.Module):
                 calibration_mode=self.calibration_mode
             )
         elif self.observer_type == 'KLObserver':
-            self.observer = KVObserver(
+            self.observer = KLObserver(
                 bit_type=self.bit_type,
                 module_type=self.module_type,
                 calibration_mode=self.calibration_mode,
-                kl_bins=self.observer_config.kl_bins
+                hist_bins=self.observer_config.kl_bins
             )
 
     def _layer_init(self):

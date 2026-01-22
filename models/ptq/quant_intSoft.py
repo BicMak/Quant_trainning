@@ -115,14 +115,25 @@ class QuantIntSoft(nn.Module):
         Args:
             x: input tensor
             scale: input scale (I-BERT 모드에서 이전 layer로부터 전달받음)
+                   channel-wise scale (tensor)이 들어오면 scalar로 변환
         Returns:
             output tensor
         """
         if self.mode == 'quantized':
-            # I-BERT Integer-only Softmax
             # scale이 None이면 self.input_scale 사용
             if scale is None:
                 scale = self.input_scale
+
+            # channel-wise scale (tensor)이면 scalar로 변환 (max 사용)
+            if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                scale = scale.max()
+            elif isinstance(scale, torch.Tensor):
+                scale = scale.item()
+
+            # scalar를 tensor로 변환
+            if not isinstance(scale, torch.Tensor):
+                scale = torch.tensor(scale)
+
             exp_int, exp_int_sum = self.int_softmax(x, scale)
             softmax_out = torch.round(exp_int_sum / exp_int)
             rounds = self.log_round(softmax_out)
@@ -150,7 +161,7 @@ def main():
 
     # 1. Observer co    nfig 생성
     bit_type_config = BitTypeConfig(bits=8, signed=False, name='uint8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         observer_type='PercentileObserver',
         bit_type=bit_type_config,
         calibration_mode='layer_wise'
@@ -259,7 +270,7 @@ def test_full_attention_pipeline(observer_type='PercentileObserver'):
 
     # ========== 1. Config 설정 ==========
     bit_type_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = ObserverConfig(
+    observer_config = QuantConfig(
         observer_type=observer_type,
         bit_type=bit_type_config,
         calibration_mode='layer_wise'

@@ -42,7 +42,12 @@ class PercentileObserver(BaseObserver):
             cur_min = torch.quantile(v, 1.0 - self.percentile_alpha, dim = 1)
         elif self.calibration_mode == 'layer_wise':
             cur_max = torch.quantile(v.reshape(-1), self.percentile_alpha)
-            cur_min = torch.quantile(v.reshape(-1), 1.0 - self.percentile_alpha)                                           
+            cur_min = torch.quantile(v.reshape(-1), 1.0 - self.percentile_alpha)
+        else:
+            raise ValueError(
+                f"Invalid calibration_mode: '{self.calibration_mode}'. "
+                f"Expected 'channel_wise' or 'layer_wise'."
+            )
 
         if self.max_val is None:
             self.max_val = cur_max

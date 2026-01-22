@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from .layer_observer.minmax import MinmaxObserver
 from .layer_observer.percentile import PercentileObserver
 from .layer_observer.omse import OmseObserver
-from .layer_observer.kv_divergence import KVObserver
+from .layer_observer.kl_divergence import KLObserver
 
 
 
@@ -44,12 +44,12 @@ def init_observers(observer_type, bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode
         )
-    elif observer_type == 'KVObserver':
-        observer = KVObserver(
+    elif observer_type == 'KLObserver':
+        observer = KLObserver(
             bit_type=bit_type,
             module_type=module_type,
             calibration_mode=calibration_mode,
-            hist_bins=quant_config.kv_bins
+            hist_bins=quant_config.kl_bins
         )
 
     return observer

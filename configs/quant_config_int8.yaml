@@ -13,7 +13,7 @@ default:
   quantization_method: Uniform  # Uniform or Log2
   percentile_alpha: 0.999
   percentile_sigma: 0.01
-  kv_bins: 2048
+  kl_bins: 2048
 
 # ==================== Weight Quantization Configurations ====================
 # Linear layer weight quantization settings
@@ -25,9 +25,9 @@ layers:
       bits: 8
       signed: true
       name: int8
-    observer_type: PercentileObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
+    percentile_alpha: 0.999
     percentile_sigma: 0.05
 
   # Attention output projection
@@ -37,7 +37,7 @@ layers:
       bits: 8
       signed: true
       name: int8
-    observer_type: PercentileObserver
+    observer_type: MinmaxObserver
     quantization_method: Uniform
     percentile_alpha: 0.995
     percentile_sigma: 0.1
@@ -73,7 +73,7 @@ layers:
       bits: 8
       signed: true
       name: int8
-    observer_type: PercentileObserver
+    observer_type: MinmaxObserver
     quantization_method: Uniform
     percentile_alpha: 0.999
     percentile_sigma: 0.01
@@ -85,7 +85,7 @@ layers:
       bits: 8
       signed: true
       name: int8
-    observer_type: PercentileObserver
+    observer_type: MinmaxObserver
     quantization_method: Uniform
     percentile_alpha: 0.999
     percentile_sigma: 0.01
@@ -95,62 +95,62 @@ layers:
 attn_layer:
   # QKV output after linear projection
   attn_qkv_output:
-    calibration_mode: layer_wise
+    calibration_mode: channel_wise
     bit_type:
       bits: 8
       signed: true
       name: int8
-    observer_type: PercentileObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
     percentile_sigma: 0.1
 
   # Key-Value activation (after split)
   kv_act:
-    calibration_mode: layer_wise
+    calibration_mode: channel_wise
     bit_type:
-      bits: 8
+      bits: 16
       signed: true
-      name: int8
-    observer_type: PercentileObserver
+      name: int16
+    observer_type: OmseObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
-    percentile_sigma: 0.2
+    percentile_alpha: 0.9999
+    percentile_sigma: 0.1
 
 
   # Softmax-Value attention output
   sv_attn:
-    calibration_mode: layer_wise
+    calibration_mode: channel_wise
     bit_type:
-      bits: 8
+      bits: 16
       signed: true
-      name: int8
-    observer_type: PercentileObserver
+      name: int16
+    observer_type: OmseObserver
     quantization_method: Uniform
-    percentile_alpha: 0.99
-    percentile_sigma: 0.2
+    percentile_alpha: 0.9999
+    percentile_sigma: 0.1
 
 
   # MLP first activation (after GELU)
   mlp_act:
-    calibration_mode: layer_wise
+    calibration_mode: channel_wise
     bit_type:
-      bits: 8
+      bits: 16
       signed: true
-      name: int8
-    observer_type: PercentileObserver
+      name: int16
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.99999
     percentile_sigma: 0.2
 
   # MLP second activation (if exists)
   mlp_act2:
-    calibration_mode: layer_wise
+    calibration_mode: channel_wise
     bit_type:
-      bits: 8
+      bits: 16
       signed: true
-      name: int8
-    observer_type: PercentileObserver
+      name: int16
+    observer_type: OmseObserver
     quantization_method: Uniform
     percentile_alpha: 0.99999
     percentile_sigma: 0.2
@@ -159,9 +159,9 @@ attn_layer:
   intSoft:
     calibration_mode: layer_wise
     bit_type:
-      bits: 8
+      bits: 16
       signed: true
-      name: int8
+      name: int16
     observer_type: PercentileObserver
     quantization_method: Uniform
     percentile_alpha: 0.99

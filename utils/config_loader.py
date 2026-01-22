@@ -29,7 +29,7 @@ def load_config_from_yaml(yaml_path: Union[str, Path]) -> LayerQuantConfig:
           quantization_method: Uniform
           percentile_alpha: 0.95
           percentile_sigma: 0.01
-          kv_bins: 2048
+          kl_bins: 2048
 
         layers:  # Weight quantization
           attn_qkv:
@@ -128,7 +128,7 @@ def _parse_quant_config(config_dict: dict) -> QuantConfig:
         quantization_method=config_dict.get('quantization_method', 'Uniform'),
         percentile_alpha=config_dict.get('percentile_alpha', 0.95),
         percentile_sigma=config_dict.get('percentile_sigma', 0.01),
-        kv_bins=config_dict.get('kv_bins', 2048)
+        kl_bins=config_dict.get('kl_bins', 2048)
     )
 
 
@@ -170,7 +170,7 @@ def _quant_config_to_dict(config: QuantConfig) -> dict:
         'quantization_method': config.quantization_method,
         'percentile_alpha': config.percentile_alpha,
         'percentile_sigma': config.percentile_sigma,
-        'kv_bins': config.kv_bins
+        'kl_bins': config.kl_bins
     }
 
 

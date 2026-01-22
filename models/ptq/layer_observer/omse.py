@@ -89,7 +89,7 @@ class OmseObserver(BaseObserver):
                     qmin, qmax) - new_zero_point_expanded) * new_scale_expanded
             
             # L2 loss
-            score = lp_loss(all_data, inputs_q, p=2.0, reduction='all')
+            score = lp_loss(all_data, inputs_q, p=1.0, reduction='all')
             
             if score < best_score:
                 best_score = score

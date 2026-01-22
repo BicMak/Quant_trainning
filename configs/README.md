@@ -18,7 +18,7 @@ default:
   quantization_method: Uniform
   percentile_alpha: 0.95
   percentile_sigma: 0.01
-  kv_bins: 2048
+  kl_bins: 2048
 
 # Weight Quantization (Linear layers)
 layers:

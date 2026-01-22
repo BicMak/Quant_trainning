@@ -219,7 +219,7 @@ def test_quant_conv(observer_type='PercentileObserver'):
 
 
 if __name__ == "__main__":
-    observer_types = ['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KVObserver']
+    observer_types = ['MinmaxObserver', 'PercentileObserver', 'OmseObserver', 'KLObserver']
 
     print("="*60)
     print("Testing All Observer Types for QuantConv2d")

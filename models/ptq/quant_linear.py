@@ -81,15 +81,22 @@ class QuantLinear(nn.Module):
         """Calibration 끝나고 한 번 호출"""
         self.scaler, self.zero = self.observer.get_quantization_params()
         self.output_scaler, self.output_zero = self.output_observer.get_quantization_params()
-        
+
+        # Device 통일: weight의 device로 모든 파라미터 이동
+        weight_device = self.weight.device
+        self.scaler = self.scaler.to(weight_device)
+        self.zero = self.zero.to(weight_device)
+        self.output_scaler = self.output_scaler.to(weight_device)
+        self.output_zero = self.output_zero.to(weight_device)
+
         # quantizer에 quantization param 설정
         self.quantizer.update_quantization_params(
             self.scaler, self.zero
             )
         self.output_quantizer.update_quantization_params(
             self.output_scaler, self.output_zero
-            )   
-        
+            )
+
         # weight quantization, save quant_weight
         # scaler와 zero를 올바른 shape으로 reshape
         range_shape = self.quantizer.get_reshape_range(self.weight)

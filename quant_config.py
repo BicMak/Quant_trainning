@@ -21,8 +21,8 @@ class QuantConfig:
     percentile_alpha: float = 0.95
     percentile_sigma: float = 0.01
 
-    # Kv observer parameters
-    kv_bins: int = 2048
+    # KL observer parameters
+    kl_bins: int = 2048
 
 
 @dataclass

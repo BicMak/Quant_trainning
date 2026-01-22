@@ -1103,7 +1103,7 @@ def test_vit_block(config_path: Union[str, Path] = None, save_logs: bool = True)
     print("  Profiling: ENABLED")
 
     # ========== 4. Calibration 데이터 생성 ==========
-    num_batches = 10
+    num_batches = 2
     batch_size = 4
     seq_len = 197  # ViT: 1 (cls token) + 196 (14x14 patches)
     embed_dim = 768
