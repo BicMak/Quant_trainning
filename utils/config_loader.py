@@ -10,15 +10,18 @@ from quant_config import QuantConfig, BitTypeConfig, LayerQuantConfig
 
 def load_config_from_yaml(yaml_path: Union[str, Path]) -> LayerQuantConfig:
     """
-    Load quantization configuration from YAML file.
+    Load quantization configuration from YAML file(s).
 
     Args:
-        yaml_path: Path to YAML configuration file
+        yaml_path: Path to YAML configuration file OR directory containing split configs
+                  - If file: Load single monolithic config
+                  - If directory: Automatically load weight_config.yaml,
+                    activation_config.yaml, and residual_config.yaml
 
     Returns:
         LayerQuantConfig object with default and layer-specific configurations
 
-    Example YAML structure:
+    Example YAML structure (single file):
         default:
           calibration_mode: channel_wise
           bit_type:
@@ -49,8 +52,22 @@ def load_config_from_yaml(yaml_path: Union[str, Path]) -> LayerQuantConfig:
         residual_layer:  # Residual quantization
           residual1:
             # config here
+
+    Example usage:
+        # Load from single file
+        config = load_config_from_yaml('configs/quant_config_int8.yaml')
+
+        # Load from directory (automatically finds 3 split files)
+        config = load_config_from_yaml('configs')
     """
     yaml_path = Path(yaml_path)
+
+    # Check if path is a directory
+    if yaml_path.is_dir():
+        # Automatically load from 3 split config files
+        return load_multi_config_from_yaml(config_dir=yaml_path)
+
+    # Otherwise, load as single file
     if not yaml_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
 
@@ -174,26 +191,167 @@ def _quant_config_to_dict(config: QuantConfig) -> dict:
     }
 
 
+def load_multi_config_from_yaml(
+    weight_config_path: Union[str, Path] = None,
+    activation_config_path: Union[str, Path] = None,
+    residual_config_path: Union[str, Path] = None,
+    config_dir: Union[str, Path] = None
+) -> LayerQuantConfig:
+    """
+    Load quantization configuration from 3 separate YAML files and merge them.
+
+    Args:
+        weight_config_path: Path to weight layer configuration file
+        activation_config_path: Path to activation layer configuration file
+        residual_config_path: Path to residual layer configuration file
+        config_dir: If provided, automatically loads from
+                   config_dir/weight_config.yaml,
+                   config_dir/activation_config.yaml,
+                   config_dir/residual_config.yaml
+
+    Returns:
+        LayerQuantConfig object with merged configurations
+
+    Example usage:
+        # Option 1: Specify directory
+        config = load_multi_config_from_yaml(config_dir='configs')
+
+        # Option 2: Specify individual files
+        config = load_multi_config_from_yaml(
+            weight_config_path='configs/weight_config.yaml',
+            activation_config_path='configs/activation_config.yaml',
+            residual_config_path='configs/residual_config.yaml'
+        )
+    """
+    # If config_dir is provided, construct paths
+    if config_dir is not None:
+        config_dir = Path(config_dir)
+        weight_config_path = config_dir / 'weight_config.yaml'
+        activation_config_path = config_dir / 'activation_config.yaml'
+        residual_config_path = config_dir / 'residual_config.yaml'
+
+    # Convert paths to Path objects
+    weight_config_path = Path(weight_config_path) if weight_config_path else None
+    activation_config_path = Path(activation_config_path) if activation_config_path else None
+    residual_config_path = Path(residual_config_path) if residual_config_path else None
+
+    # Load configurations
+    all_config_dicts = []
+    config_paths = [
+        ('weight', weight_config_path),
+        ('activation', activation_config_path),
+        ('residual', residual_config_path)
+    ]
+
+    for config_name, config_path in config_paths:
+        if config_path and config_path.exists():
+            with open(config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+                all_config_dicts.append((config_name, config_dict))
+        elif config_path:
+            print(f"Warning: {config_name} config file not found: {config_path}")
+
+    if not all_config_dicts:
+        raise ValueError("No valid configuration files found")
+
+    # Use the first config's default as the global default
+    # (typically weight_config.yaml should have the most general default)
+    default_dict = all_config_dicts[0][1].get('default', {})
+    default_config = _parse_quant_config(default_dict)
+
+    # Merge all layer configurations
+    layer_configs = {}
+
+    for config_name, config_dict in all_config_dicts:
+        # Get default from this config file (for merging)
+        file_default_dict = config_dict.get('default', default_dict)
+
+        # Process 'layers' section (weight quantization)
+        layers_dict = config_dict.get('layers', {})
+        for layer_name, layer_dict in layers_dict.items():
+            if layer_dict is None or not layer_dict:
+                continue
+
+            merged_dict = {**file_default_dict, **layer_dict}
+            if 'bit_type' in layer_dict and 'bit_type' in file_default_dict:
+                merged_dict['bit_type'] = {**file_default_dict['bit_type'], **layer_dict['bit_type']}
+
+            layer_configs[layer_name] = _parse_quant_config(merged_dict)
+
+        # Process 'attn_layer' section (activation quantization)
+        attn_layer_dict = config_dict.get('attn_layer', {})
+        for layer_name, layer_dict in attn_layer_dict.items():
+            if layer_dict is None or not layer_dict:
+                continue
+
+            merged_dict = {**file_default_dict, **layer_dict}
+            if 'bit_type' in layer_dict and 'bit_type' in file_default_dict:
+                merged_dict['bit_type'] = {**file_default_dict['bit_type'], **layer_dict['bit_type']}
+
+            layer_configs[layer_name] = _parse_quant_config(merged_dict)
+
+        # Process 'residual_layer' section (residual quantization)
+        residual_layer_dict = config_dict.get('residual_layer', {})
+        for layer_name, layer_dict in residual_layer_dict.items():
+            if layer_dict is None or not layer_dict:
+                continue
+
+            merged_dict = {**file_default_dict, **layer_dict}
+            if 'bit_type' in layer_dict and 'bit_type' in file_default_dict:
+                merged_dict['bit_type'] = {**file_default_dict['bit_type'], **layer_dict['bit_type']}
+
+            layer_configs[layer_name] = _parse_quant_config(merged_dict)
+
+    return LayerQuantConfig(
+        default_config=default_config,
+        layer_configs=layer_configs
+    )
+
+
 if __name__ == '__main__':
     # Test loading configurations
     configs_dir = Path(__file__).parent.parent / 'configs'
 
-    print("Testing INT8 configuration:")
+    print("="*80)
+    print("Testing Single-File Configuration Loading")
+    print("="*80)
+
+    print("\nTesting INT8 configuration:")
     int8_config = load_config_from_yaml(configs_dir / 'quant_config_int8.yaml')
     print(f"  Default bits: {int8_config.default_config.bit_type.bits}")
     print(f"  Default observer: {int8_config.default_config.observer_type}")
     print(f"  Layer configs: {list(int8_config.layer_configs.keys())}")
 
-    print("\nTesting Mixed Precision configuration:")
-    mixed_config = load_config_from_yaml(configs_dir / 'quant_config_mixed_precision.yaml')
-    print(f"  Default bits: {mixed_config.default_config.bit_type.bits}")
-    print(f"  attn_qkv bits: {mixed_config.get_config('attn_qkv').bit_type.bits}")
-    print(f"  kv_act bits: {mixed_config.get_config('kv_act').bit_type.bits}")
-    print(f"  mlp_fc1 bits: {mixed_config.get_config('mlp_fc1').bit_type.bits}")
+    print("\n" + "="*80)
+    print("Testing Multi-File Configuration Loading")
+    print("="*80)
 
-    print("\nTesting Aggressive configuration:")
-    aggressive_config = load_config_from_yaml(configs_dir / 'quant_config_aggressive.yaml')
-    print(f"  Default bits: {aggressive_config.default_config.bit_type.bits}")
-    print(f"  attn_qkv bits: {aggressive_config.get_config('attn_qkv').bit_type.bits}")
-    print(f"  kv_act bits: {aggressive_config.get_config('kv_act').bit_type.bits}")
-    print(f"  mlp_fc1 bits: {aggressive_config.get_config('mlp_fc1').bit_type.bits}")
+    print("\nLoading from 3 separate YAML files:")
+    multi_config = load_multi_config_from_yaml(config_dir=configs_dir)
+    print(f"  Default bits: {multi_config.default_config.bit_type.bits}")
+    print(f"  Default observer: {multi_config.default_config.observer_type}")
+    print(f"  Total layer configs: {len(multi_config.layer_configs)}")
+    print(f"  Layer configs: {list(multi_config.layer_configs.keys())}")
+
+    print("\n[Layer-specific Configuration Check]")
+    # Check weight layers
+    print("  Weight layers:")
+    for layer_name in ['attn_qkv', 'attn_proj', 'mlp_fc1', 'mlp_fc2', 'norm1', 'norm2']:
+        config = multi_config.get_config(layer_name)
+        print(f"    {layer_name}: {config.bit_type.bits}-bit, {config.observer_type}")
+
+    # Check activation layers
+    print("\n  Activation layers:")
+    for layer_name in ['attn_qkv_output', 'kv_act', 'sv_attn', 'mlp_act', 'mlp_act2', 'intSoft']:
+        config = multi_config.get_config(layer_name)
+        print(f"    {layer_name}: {config.bit_type.bits}-bit, {config.observer_type}")
+
+    # Check residual layers
+    print("\n  Residual layers:")
+    for layer_name in ['residual1', 'residual2']:
+        config = multi_config.get_config(layer_name)
+        print(f"    {layer_name}: {config.bit_type.bits}-bit, {config.observer_type}")
+
+    print("\n" + "="*80)
+    print("Configuration Loading Tests Completed Successfully!")
+    print("="*80)

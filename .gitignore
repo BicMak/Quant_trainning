@@ -29,6 +29,7 @@ logs/
 runs/
 wandb/
 mlruns/
+imagenet-mini/
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -44,6 +45,7 @@ mlruns/
 # OS
 .DS_Store
 Thumbs.db
+backup/
 
 # Data
 data/
