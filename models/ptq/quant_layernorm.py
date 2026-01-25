@@ -10,15 +10,20 @@ from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
+from .layer_profiler.profiler import profiler
 
 class QLayerNorm(nn.Module):
     def __init__(self,
                  input_module: nn.Module,
-                 quant_config: QuantConfig):
+                 quant_config: QuantConfig,
+                 layer_name: str = 'qlayernorm',
+                 enable_profiling: bool = False):
         super().__init__()
 
         # quant_config에서 설정 추출
         self.input_module = input_module
+        self.layer_name = layer_name
+        self.enable_profiling = enable_profiling
         self.quant_config = quant_config
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
@@ -49,11 +54,16 @@ class QLayerNorm(nn.Module):
 
         #2. quantizer build
         self.output_quantizer = build_quantizer(
-            quantizer_str='uniform', 
+            quantizer_str='uniform',
             bit_type=self.bit_type,
             module_type='activation')
 
-        #2. layer initialization  
+        #3. profiler 초기화
+        self.profiler = None
+        if self.enable_profiling:
+            self.profiler = profiler(layer_name)
+
+        #4. layer initialization
         self.fwd_kwargs = dict()
         self.fwd_func = F.layer_norm
 
@@ -122,7 +132,7 @@ class QLayerNorm(nn.Module):
         # 배치별 alpha 중 평균 후 반올림
         return torch.stack(all_alphas).float().mean(dim=0).round().int() 
 
-    def compute_quant_params(self,calib_loader):
+    def compute_quant_params(self, calib_loader):
         """Calibration 끝나고 한 번 호출"""
         scale, self.zero = self.output_observer.get_quantization_params()
 
@@ -131,8 +141,8 @@ class QLayerNorm(nn.Module):
         self.scale = scale.fill_(self.s_base)  # shape 유지하면서 값만 통일
         self.output_quantizer.update_quantization_params(
             self.scale, self.zero
-            )   
-        
+            )
+
         if calib_loader is not None:
             self.alpha = self._find_alpha(calib_loader)
             # PTF 적용: scale = 2^alpha * s_base
@@ -144,184 +154,457 @@ class QLayerNorm(nn.Module):
 
         return (self.scale, self.zero)
 
+    def get_profiler(self):
+        """Get profiler object"""
+        if self.enable_profiling and self.profiler is not None:
+            return self.profiler
+        return None
 
-    def forward(self, x):
-        # LayerNorm은 FP32로 계산, 출력만 양자화
+    def get_profiling_results(self):
+        """
+        Get all profiling results after forward pass.
+
+        Returns:
+            dict: Dictionary containing statistics, histogram, time, and memory records
+                  Returns None if profiling is not enabled
+
+        Usage:
+            layer.forward(x)  # Automatically updates profiler
+            results = layer.get_profiling_results()
+            print(results['statistics']['qsnr'])
+            print(results['time'])
+        """
+        if not self.enable_profiling or self.profiler is None:
+            return None
+
+        try:
+            stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
+            hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+        except (ValueError, AttributeError):
+            # update_weight()가 아직 호출되지 않은 경우
+            stats = None
+            hist = None
+
+        return {
+            'statistics': stats,
+            'histogram': hist,
+            'time': self.profiler.get_time_record(),
+            'memory': self.profiler.get_memory_record()
+        }
+
+    def reset_profiling(self):
+        """Reset profiling data"""
+        if self.enable_profiling and self.profiler is not None:
+            self.profiler.reset_time_profiler()
+            self.profiler.reset_memory_profiler()
+            self.profiler.weight = None
+            self.profiler.quant_weight = None
+
+
+    @staticmethod
+    def get_MN(x, bit=8):
+        """
+        FQ-ViT bit-shift 파라미터 계산
+        x / scale → (M * x) >> N 변환을 위한 M, N 계산
+
+        Args:
+            x: 입력 텐서 (일반적으로 affine transform 계수)
+            bit: 비트 폭 (default: 8)
+
+        Returns:
+            M: Mantissa (고정소수점 표현)
+            N: Shift 값 (2^N으로 나눌 값)
+        """
+        # N: 시프트 값 계산 (2^N으로 나눌 값)
+        N = torch.clamp(bit - 1 - torch.floor(torch.log2(x + 1e-8)), 0, 31)
+        # M: Mantissa (고정소수점 표현)
+        M = torch.clamp(torch.floor(x * torch.pow(2, N)), 0, 2 ** bit - 1)
+        return M, N
+
+    def _integer_layernorm(self, x, in_quantizer, out_quantizer):
+        """
+        FQ-ViT Integer LayerNorm (bit-shift 기반)
+
+        Args:
+            x: 입력 텐서
+            in_quantizer: 이전 레이어의 quantizer (scale 정보 포함)
+            out_quantizer: 다음 레이어의 quantizer (scale 정보 포함)
+        """
+        in_scale = in_quantizer.scale
+        out_scale = out_quantizer.scale
+
+        # Tensor shape: (B, N, C)
+        channel_nums = x.shape[-1]
+
+        # 1. Input de-quantization (INT8 → integer domain 개념상)
+        x_q = (x / in_scale).round()
+
+        # 2. Scale 통일 (channel-wise → layer-wise)
+        # in_scale이 channel-wise일 경우 layer-wise로 변환
+        if in_scale.numel() > 1:
+            in_scale1 = in_scale.min()
+            in_scale_mask = (in_scale / in_scale1).round()
+            x_q = x_q * in_scale_mask
+        else:
+            in_scale1 = in_scale
+
+        # 3. Integer domain에서 mean, std 계산
+        mean_x_q = x_q.mean(dim=-1, keepdim=True) * in_scale1
+
+        # Variance 계산 (integer domain)
+        var_x_q = (in_scale1 / channel_nums) * torch.sqrt(
+            channel_nums * (x_q ** 2).sum(dim=-1, keepdim=True) -
+            x_q.sum(dim=-1, keepdim=True) ** 2 + 1e-5
+        )
+
+        # 4. Affine transformation 계산 (bit-shift 준비)
+        # A = (in_scale1 / std) * weight / out_scale
+        A = (in_scale1 / (var_x_q + self.eps)) * \
+            self.weight.reshape(1, 1, -1) / out_scale
+        A_sign = A.sign()
+        M, N = self.get_MN(A.abs(), bit=self.bit_type.bits)
+
+        # B = (bias - mean * weight / std) / out_scale * 2^N
+        if self.bias is not None:
+            B = ((self.bias.reshape(1, 1, -1) -
+                  (mean_x_q / (var_x_q + self.eps)) * self.weight.reshape(1, 1, -1))
+                 / out_scale * torch.pow(2, N)).round()
+        else:
+            B = (-(mean_x_q / (var_x_q + self.eps)) * self.weight.reshape(1, 1, -1)
+                 / out_scale * torch.pow(2, N)).round()
+
+        # 5. Integer-only 연산 (bit-shift)
+        x_q = ((A_sign * M * x_q + B) / torch.pow(2, N)).round()
+
+        # 6. Re-quantization
+        x = x_q * out_scale
+
+        return x
+
+    def forward(self, x, in_quantizer=None, out_quantizer=None):
+        """
+        Forward pass with optional Integer LayerNorm
+
+        Args:
+            x: 입력 텐서
+            in_quantizer: 이전 레이어의 quantizer (scale propagation용)
+            out_quantizer: 다음 레이어의 quantizer (scale propagation용)
+        """
+        # Integer LayerNorm 모드 (FQ-ViT 방식)
+        if self.mode == 'int' and in_quantizer is not None and out_quantizer is not None:
+            if self.enable_profiling and self.profiler is not None:
+                with self.profiler.measure_time():
+                    return self._integer_layernorm(x, in_quantizer, out_quantizer)
+            else:
+                return self._integer_layernorm(x, in_quantizer, out_quantizer)
+
+        # FP32 또는 기존 Quantized 모드
         out = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
 
         if self.mode == 'quantized':
-            out = self.output_quantizer.forward(out)
+            if self.enable_profiling and self.profiler is not None:
+                # Measure quantization time
+                with self.profiler.measure_time():
+                    # Store FP32 output before quantization
+                    fp32_output = out.clone().detach()
+                    # Fake quantization: quant -> dequant
+                    out = self.output_quantizer.forward(out)
+                    # Update profiler with FP32 vs Quantized outputs
+                    self.profiler.update_weight(fp32_output, out.detach())
+            else:
+                out = self.output_quantizer.forward(out)
+        elif self.enable_profiling and self.profiler is not None:
+            # FP32 mode - measure time without quantization
+            with self.profiler.measure_time():
+                pass  # No quantization, just time measurement
 
-        return out  
-            
+        return out
 
 
-def test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True):
-    # ========== 1. Config 설정 ==========
-    bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    quant_config = QuantConfig(
-        calibration_mode='channel_wise',
-        bit_type=bit_config,
-        observer_type=observer_type
+def test_qlayernorm_profiling():
+    """
+    Test QLayerNorm profiling functionality.
+
+    Tests:
+    1. Forward pass automatically updates profiler
+    2. get_profiling_results() returns correct data
+    3. Statistics, histogram, and timing info are collected
+    4. PTF (Per-Tensor-Factorization) functionality
+    """
+    print("="*80)
+    print("QLayerNorm Profiling Test")
+    print("="*80)
+
+    # Create test LayerNorm module
+    print("\n[1] Creating LayerNorm module")
+    normalized_shape = 768
+    original_ln = nn.LayerNorm(normalized_shape)
+    print(f"  ✓ Original LayerNorm created (normalized_shape={normalized_shape})")
+
+    # Create test config
+    config = QuantConfig(
+        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
+        observer_type='minmax',
+        calibration_mode='channel_wise'
     )
 
-    # ========== 2. LayerNorm 포함 모델 생성 ==========
-    class SimpleTransformerBlock(nn.Module):
-        def __init__(self, hidden_dim=768):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(hidden_dim)
-            self.ln2 = nn.LayerNorm(hidden_dim)
-            self.fc1 = nn.Linear(hidden_dim, hidden_dim * 4)
-            self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim)
+    # Create QLayerNorm with profiling enabled
+    print("\n[2] Creating QLayerNorm with profiling enabled")
+    layer = QLayerNorm(
+        input_module=original_ln,
+        quant_config=config,
+        layer_name='test_qlayernorm',
+        enable_profiling=True
+    )
+    print("  ✓ QLayerNorm created")
+    print(f"  Layer name: {layer.layer_name}")
+    print(f"  Profiling enabled: {layer.enable_profiling}")
+    print(f"  Profiler object: {layer.profiler is not None}")
+    print(f"  Normalized shape: {layer.normalized_shape}")
 
-        def forward(self, x):
-            x = self.ln1(x)
-            x = F.gelu(self.fc1(x))
-            x = self.fc2(x)
-            x = self.ln2(x)
-            return x
+    # Generate test data
+    print("\n[3] Generating calibration data")
+    batch_size = 8
+    seq_len = 197  # ViT patch tokens (196 patches + 1 cls token)
+    feature_dim = 768
+    num_calib_batches = 10
 
-    hidden_dim = 768
-    model = SimpleTransformerBlock(hidden_dim)
+    calib_data = [torch.randn(batch_size, seq_len, feature_dim) for _ in range(num_calib_batches)]
+    print(f"  Calibration batches: {num_calib_batches}")
+    print(f"  Batch shape: {calib_data[0].shape}")
 
-    print(f"\n{'='*60}")
-    print(f"Testing QLayerNorm with {observer_type} (PTF: {use_ptf})")
-    print(f"{'='*60}")
-    print("Original LayerNorm layers:")
-    for name, module in model.named_modules():
-        if isinstance(module, nn.LayerNorm):
-            print(f"  {name}: {module}")
+    # Calibration
+    print("\n[4] Running calibration")
+    layer.eval()
+    with torch.no_grad():
+        for idx, x in enumerate(calib_data):
+            _ = layer.calibration(x)
+            if (idx + 1) % 5 == 0:
+                print(f"  Batch {idx + 1}/{num_calib_batches} completed")
+    print("  ✓ Calibration completed")
 
-    # ========== 3. QLayerNorm으로 변환 ==========
-    quant_ln_layers = {}
-    for name, layer in model.named_modules():
-        if isinstance(layer, nn.LayerNorm):
-            quant_layer = QLayerNorm(
-                input_module=layer,
-                quant_config=quant_config
-            )
-            quant_ln_layers[name] = quant_layer
-            print(f"Converted: {name}")
-
-    print(f"\nQLayerNorm 개수: {len(quant_ln_layers)}")
-
-    # ========== 4. 더미 Calibration 데이터 생성 ==========
-    num_batches = 32
-    batch_size = 16
-    seq_len = 197  # ViT: 196 patches + 1 cls token
-
-    print(f"\n더미 데이터 생성: {num_batches} batches x {batch_size} x {seq_len} x {hidden_dim}")
-    calib_data = [
-        torch.randn(batch_size, seq_len, hidden_dim)
-        for _ in range(num_batches)
-    ]
-
-    # ========== 5. Calibration 수행 (1차: observer update) ==========
-    print("\n=== Calibration 시작 (1차: Observer Update) ===")
-    for batch_idx, x in enumerate(calib_data):
-        # ln1 calibration
-        out = quant_ln_layers['ln1'].calibration(x)
-        out = F.gelu(model.fc1(out))
-        out = model.fc2(out)
-        # ln2 calibration
-        out = quant_ln_layers['ln2'].calibration(out)
-
-        if (batch_idx + 1) % 8 == 0:
-            print(f"Batch {batch_idx + 1}/{num_batches} 완료")
-
-    print("=== Calibration 1차 완료 ===")
-
-    # ========== 6. Observer 통계 확인 ==========
-    print("\n=== Observer 통계 ===")
-    for name, layer in quant_ln_layers.items():
-        print(f"\n{name}:")
-        print(f"  Observer type: {type(layer.output_observer).__name__}")
-        if layer.output_observer.min_val.shape == torch.Size([]):
-            print(f"  Output min_val: {layer.output_observer.min_val.item()}")
-            print(f"  Output max_val: {layer.output_observer.max_val.item()}")
-        else:     
-            print(f"  Output min_val: {layer.output_observer.min_val}")
-            print(f"  Output max_val: {layer.output_observer.max_val}")
-
-    # ========== 7. Quantization Params 계산 (2차: PTF alpha 탐색) ==========
-    print("\n=== Quantization Parameters 계산 ===")
-    for name, layer in quant_ln_layers.items():
-        if use_ptf:
-            scale, zero = layer.compute_quant_params(calib_loader=calib_data)
-            print(f"\n{name} (PTF 적용):")
-            print(f"  Alpha (first 10): {layer.alpha[:10].tolist()}")
+    # Compute quantization parameters (without PTF for simplicity)
+    print("\n[5] Computing quantization parameters")
+    scaler, zero = layer.compute_quant_params(calib_loader=None)
+    print(f"  Scale shape: {scaler.shape if isinstance(scaler, torch.Tensor) else 'scalar'}")
+    print(f"  Scale (first 5): {scaler[:5] if isinstance(scaler, torch.Tensor) and scaler.numel() > 5 else scaler}")
+    if isinstance(zero, torch.Tensor):
+        if zero.numel() == 1:
+            print(f"  Zero point: {zero.item()}")
         else:
-            scale, zero = layer.compute_quant_params(calib_loader=None)
-            print(f"\n{name} (PTF 미적용):")
+            print(f"  Zero point shape: {zero.shape}, first 5: {zero[:5]}")
+    else:
+        print(f"  Zero point: {zero}")
+    print(f"  Alpha (first 5): {layer.alpha[:5]}")
+    print("  ✓ Quantization parameters computed")
 
-        print(f"  Scale shape: {scale.shape}")
-        print(f"  Scale (first 5): {scale[:5].tolist()}")
-        print(f"  s_base: {layer.s_base:.8f}")
+    # Test data
+    test_input = torch.randn(1, seq_len, feature_dim)
 
-    # ========== 8. FP32 vs Fake Quantization 비교 ==========
-    print("\n=== FP32 vs Fake Quantization 출력 비교 ===")
-    test_input = torch.randn(1, seq_len, hidden_dim)
+    # FP32 inference
+    print("\n[6] Testing FP32 mode (no quantization)")
+    layer.mode = 'fp32'
+    layer.reset_profiling()
 
-    # FP32 forward
-    for layer in quant_ln_layers.values():
-        layer.mode = 'fp32'
+    with torch.no_grad():
+        for _ in range(50):
+            _ = layer(test_input)
 
-    out_fp32 = quant_ln_layers['ln1'](test_input)
-    out_fp32 = F.gelu(model.fc1(out_fp32))
-    out_fp32 = model.fc2(out_fp32)
-    out_fp32 = quant_ln_layers['ln2'](out_fp32)
+    results_fp32 = layer.get_profiling_results()
+    print("  ✓ FP32 forward completed (50 iterations)")
 
-    # Fake Quantization forward
-    for layer in quant_ln_layers.values():
-        layer.mode = 'quantized'
+    if results_fp32 and results_fp32['time']:
+        time_data = results_fp32['time']
+        if 'test_qlayernorm' in time_data:
+            stats = time_data['test_qlayernorm']
+            print(f"  Timing - Count: {stats['count']}, Mean: {stats['mean']*1000:.4f} ms")
+        else:
+            print("  Warning: No timing data for 'test_qlayernorm'")
+    else:
+        print("  Warning: No timing results in FP32 mode")
 
-    out_quant = quant_ln_layers['ln1'](test_input)
-    out_quant = F.gelu(model.fc1(out_quant))
-    out_quant = model.fc2(out_quant)
-    out_quant = quant_ln_layers['ln2'](out_quant)
+    # Quantized inference
+    print("\n[7] Testing Quantized mode (with profiling)")
+    layer.mode = 'quantized'
+    layer.reset_profiling()
 
-    mse = F.mse_loss(out_fp32, out_quant).item()
-    max_diff = (out_fp32 - out_quant).abs().max().item()
-    cosine_sim = F.cosine_similarity(out_fp32.flatten().unsqueeze(0),
-                                      out_quant.flatten().unsqueeze(0)).item()
+    print("  Running 100 iterations...")
+    with torch.no_grad():
+        for _ in range(100):
+            output_quant = layer(test_input)
 
-    print(f"Output shape: {out_fp32.shape}")
-    print(f"MSE: {mse:.6f}")
-    print(f"Max diff: {max_diff:.6f}")
-    print(f"Cosine Similarity: {cosine_sim:.4f} ({cosine_sim*100:.2f}%)")
+    print("  ✓ Quantized forward completed (100 iterations)")
+    print(f"  Output shape: {output_quant.shape}")
+    print(f"  Output range: [{output_quant.min():.6f}, {output_quant.max():.6f}]")
 
-    print(f"\n=== {observer_type} (PTF: {use_ptf}) 테스트 완료 ===\n")
+    # Get profiling results
+    print("\n[8] Retrieving profiling results")
+    results = layer.get_profiling_results()
 
-    return mse, cosine_sim
+    if results is None:
+        print("  ✗ ERROR: get_profiling_results() returned None!")
+        return
+
+    print("  ✓ Profiling results retrieved")
+    print(f"  Result keys: {list(results.keys())}")
+
+    # Check statistics
+    print("\n[9] Statistics")
+    if results['statistics'] is not None:
+        stats = results['statistics']
+        print("  ✓ Statistics available")
+        qsnr = stats.get('qsnr', 'N/A')
+        mse = stats.get('mse', 'N/A')
+        max_error = stats.get('max_error', 'N/A')
+        mean_error = stats.get('mean_error', 'N/A')
+
+        print(f"    QSNR: {qsnr:.2f} dB" if isinstance(qsnr, (int, float)) else f"    QSNR: {qsnr}")
+        print(f"    MSE: {mse:.10f}" if isinstance(mse, (int, float)) else f"    MSE: {mse}")
+        print(f"    Max Error: {max_error:.6f}" if isinstance(max_error, (int, float)) else f"    Max Error: {max_error}")
+        print(f"    Mean Error: {mean_error:.6f}" if isinstance(mean_error, (int, float)) else f"    Mean Error: {mean_error}")
+    else:
+        print("  ✗ Statistics: None")
+
+    # Check histogram
+    print("\n[10] Histogram")
+    if results['histogram'] is not None:
+        hist = results['histogram']
+        print("  ✓ Histogram available")
+        if 'kl_divergence' in hist:
+            print(f"    KL Divergence: {hist['kl_divergence']:.6f}")
+        print(f"    Histogram keys: {list(hist.keys())}")
+    else:
+        print("  ✗ Histogram: None")
+
+    # Check timing
+    print("\n[11] Timing Information")
+    time_data = results['time']
+    if time_data and 'test_qlayernorm' in time_data:
+        time_stats = time_data['test_qlayernorm']
+        print("  ✓ Timing data available")
+        print(f"    Count: {time_stats['count']}")
+        print(f"    Mean: {time_stats['mean']*1000:.4f} ms")
+        print(f"    Min: {time_stats['min']*1000:.4f} ms")
+        print(f"    Max: {time_stats['max']*1000:.4f} ms")
+        print(f"    Total: {time_stats['total']*1000:.4f} ms")
+    else:
+        print("  ✗ Timing: No data for 'test_qlayernorm'")
+        print("    Available keys: {}".format(list(time_data.keys()) if time_data else 'None'))
+
+    # Check memory
+    print("\n[12] Memory Information")
+    mem_data = results['memory']
+    if mem_data:
+        print(f"  Memory profiler data: {mem_data}")
+    else:
+        print("  Memory: No data (expected if not attached)")
+
+    # Verify profiler object
+    print("\n[13] Verifying profiler object")
+    prof = layer.get_profiler()
+    if prof is not None:
+        print("  ✓ get_profiler() returns profiler object")
+        print(f"    Profiler name: {prof.name}")
+        print(f"    Has weight: {prof.weight is not None}")
+        print(f"    Has quant_weight: {prof.quant_weight is not None}")
+    else:
+        print("  ✗ get_profiler() returned None")
+
+    # Test reset
+    print("\n[14] Testing reset_profiling()")
+    layer.reset_profiling()
+    print("  ✓ reset_profiling() called")
+
+    # Verify reset
+    prof_after_reset = layer.get_profiler()
+    if prof_after_reset is not None:
+        print(f"    Weight after reset: {prof_after_reset.weight}")
+        print(f"    Quant weight after reset: {prof_after_reset.quant_weight}")
+
+    # Test with PTF
+    print("\n[15] Testing with PTF (Per-Tensor-Factorization)")
+    print("  Re-calibrating with PTF enabled...")
+    layer.reset_profiling()
+
+    # Re-calibration for PTF
+    with torch.no_grad():
+        for x in calib_data:
+            _ = layer.calibration(x)
+
+    # Compute with PTF
+    scaler_ptf, zero_ptf = layer.compute_quant_params(calib_loader=calib_data)
+    print(f"  ✓ PTF quantization parameters computed")
+    print(f"    Alpha (first 10): {layer.alpha[:10]}")
+    print(f"    Scale with PTF (first 5): {scaler_ptf[:5] if isinstance(scaler_ptf, torch.Tensor) and scaler_ptf.numel() > 5 else scaler_ptf}")
+
+    # Test quantized with PTF
+    layer.mode = 'quantized'
+    with torch.no_grad():
+        output_ptf = layer(test_input)
+    print(f"  Output with PTF range: [{output_ptf.min():.6f}, {output_ptf.max():.6f}]")
+
+    # Summary
+    print("\n" + "="*80)
+    print("Test Summary")
+    print("="*80)
+
+    passed_tests = []
+    failed_tests = []
+
+    # Check critical functionality
+    if layer.profiler is not None:
+        passed_tests.append("Profiler initialization")
+    else:
+        failed_tests.append("Profiler initialization")
+
+    if results is not None:
+        passed_tests.append("get_profiling_results() returns data")
+    else:
+        failed_tests.append("get_profiling_results() returns data")
+
+    if results and results['statistics'] is not None:
+        passed_tests.append("Statistics collection (FP32 vs Quantized)")
+    else:
+        failed_tests.append("Statistics collection")
+
+    if results and results['histogram'] is not None:
+        passed_tests.append("Histogram generation")
+    else:
+        failed_tests.append("Histogram generation")
+
+    if results and results['time'] and 'test_qlayernorm' in results['time']:
+        passed_tests.append("Timing profiling")
+    else:
+        failed_tests.append("Timing profiling")
+
+    if layer.alpha is not None and layer.alpha.numel() > 0:
+        passed_tests.append("PTF (Per-Tensor-Factorization)")
+    else:
+        failed_tests.append("PTF")
+
+    print(f"\n✓ Passed: {len(passed_tests)}")
+    for test in passed_tests:
+        print(f"  - {test}")
+
+    if failed_tests:
+        print(f"\n✗ Failed: {len(failed_tests)}")
+        for test in failed_tests:
+            print(f"  - {test}")
+
+    print("\n" + "="*80)
+    if len(failed_tests) == 0:
+        print("ALL TESTS PASSED!")
+    else:
+        print(f"SOME TESTS FAILED ({len(failed_tests)}/{len(passed_tests) + len(failed_tests)})")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    print("="*60)
-    print("Testing QLayerNorm with PercentileObserver (channel_wise)")
-    print("="*60)
+    import sys
+    from pathlib import Path
+    # Add project root to path
+    project_root = Path(__file__).parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-    results = []
-
-    # PercentileObserver - PTF 미적용
-    try:
-        mse, cos = test_quant_layernorm(observer_type='PercentileObserver', use_ptf=False)
-        results.append(('PercentileObserver (no PTF)', mse, cos))
-    except Exception as e:
-        print(f"PercentileObserver (no PTF) 실패: {e}")
-
-    # PercentileObserver - PTF 적용
-    try:
-        mse, cos = test_quant_layernorm(observer_type='PercentileObserver', use_ptf=True)
-        results.append(('PercentileObserver (PTF)', mse, cos))
-    except Exception as e:
-        print(f"PercentileObserver (PTF) 실패: {e}")
-
-    # 결과 요약
-    print("="*60)
-    print("결과 요약")
-    print("="*60)
-    print(f"{'Method':<30} {'MSE':<15} {'Cosine Sim':<15}")
-    print("-"*60)
-    for name, mse, cos in results:
-        print(f"{name:<30} {mse:<15.6f} {cos*100:<14.2f}%")
-    print("="*60)
+    test_qlayernorm_profiling()

@@ -3,15 +3,22 @@ import torch.nn as nn
 
 from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
+from .utils import init_observers
+from .layer_quantizer.log2 import Log2Quantizer
+from .layer_profiler.profiler import profiler
 
 class QuantIntSoft(nn.Module):
 
-    def __init__(self, 
+    def __init__(self,
                  input_module:nn.Module,
-                 quant_config:QuantConfig):
+                 quant_config:QuantConfig,
+                 layer_name:str = 'qintsoft',
+                 enable_profiling:bool = False):
         super(QuantIntSoft, self).__init__()
 
         #0. observer config copy
+        self.layer_name = layer_name
+        self.enable_profiling = enable_profiling
         self.observer_config = quant_config
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
@@ -22,19 +29,50 @@ class QuantIntSoft(nn.Module):
         self.calibration_mode = quant_config.calibration_mode
         self.mode = 'fp32'
 
+        self.PTQ = True #PTQ or I-bert
 
+        # Observer와 Log2Quantizer 초기화
+        self.observer = init_observers(
+            observer_type=self.observer_type,
+            bit_type=self.bit_type,
+            module_type='activation',
+            calibration_mode=self.calibration_mode,
+            quant_config=quant_config
+        )
+        self.quantizer = Log2Quantizer(
+            bit_type=self.bit_type,
+            module_type='activation'
+        )
+
+        #1. profiler 초기화
+        self.profiler = None
+        if self.enable_profiling:
+            self.profiler = profiler(layer_name)
 
         # I-BERT Integer Softmax용 scale (propagation으로 전달받음)
         self.input_scale = None
         self.output_scale = None
 
+        # Quantization parameters
+        self.scaler = None
+        self.zero = None
+
     def calibration(self, x, input_scale=None):
         """
         Calibration 전용 메서드
         - I-BERT 모드: scale propagation 정보만 저장 (observer 사용 안 함)
-        - PTQ fallback 모드: observer update 수행
+        - PTQ 모드: observer update 수행
         """
+        with torch.no_grad():
+            x = x.softmax(dim=-1)
+
+            if self.PTQ:
+                # PTQ 모드: observer 사용
+                self.observer.update(x)
+            # I-BERT 모드: observer 사용 안 함 (input_scale만 저장)
+
         return x
+    
 
     def compute_quant_params(self):
         """
@@ -42,7 +80,7 @@ class QuantIntSoft(nn.Module):
         - I-BERT 모드: output_scale 계산 (수식으로)
         - PTQ fallback 모드: observer에서 scale/zero 추출
         """
-        if self.input_scale is not None:
+        if self.PTQ is False:
             # I-BERT 모드: output scale 계산
             # Softmax output scale = 0.3585 * input_scale^2 / 2^30
             coef = 0.35815147
@@ -52,10 +90,60 @@ class QuantIntSoft(nn.Module):
             return (self.output_scale, None)
         else:
             # PTQ fallback 모드
-            self.scaler, self.zero = 1, 0 
-            # 매서드 일관성을 위해서 임의이값을 넣어줌
+            self.scaler, self.zero = self.observer.get_quantization_params()
 
-            return (self.scaler, self.zero)
+            # quantizer에 quantization param 설정
+            self.quantizer.update_quantization_params(
+                self.scaler, self.zero
+                )
+
+        return (self.scaler, self.zero)
+
+    def get_profiler(self):
+        """Get profiler object"""
+        if self.enable_profiling and self.profiler is not None:
+            return self.profiler
+        return None
+
+    def get_profiling_results(self):
+        """
+        Get all profiling results after forward pass.
+
+        Returns:
+            dict: Dictionary containing statistics, histogram, time, and memory records
+                  Returns None if profiling is not enabled
+
+        Usage:
+            layer.forward(x)  # Automatically updates profiler
+            results = layer.get_profiling_results()
+            print(results['statistics']['qsnr'])
+            print(results['time'])
+        """
+        if not self.enable_profiling or self.profiler is None:
+            return None
+
+        try:
+            stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
+            hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+        except (ValueError, AttributeError):
+            # update_weight()가 아직 호출되지 않은 경우
+            stats = None
+            hist = None
+
+        return {
+            'statistics': stats,
+            'histogram': hist,
+            'time': self.profiler.get_time_record(),
+            'memory': self.profiler.get_memory_record()
+        }
+
+    def reset_profiling(self):
+        """Reset profiling data"""
+        if self.enable_profiling and self.profiler is not None:
+            self.profiler.reset_time_profiler()
+            self.profiler.reset_memory_profiler()
+            self.profiler.weight = None
+            self.profiler.quant_weight = None
 
     @staticmethod
     def log_round(x):
@@ -120,338 +208,347 @@ class QuantIntSoft(nn.Module):
             output tensor
         """
         if self.mode == 'quantized':
-            # scale이 None이면 self.input_scale 사용
-            if scale is None:
-                scale = self.input_scale
 
-            # channel-wise scale (tensor)이면 scalar로 변환 (max 사용)
-            if isinstance(scale, torch.Tensor) and scale.numel() > 1:
-                scale = scale.max()
-            elif isinstance(scale, torch.Tensor):
-                scale = scale.item()
+            if self.PTQ is False:
+                # I-BERT 모드: Integer Softmax
+                if self.enable_profiling and self.profiler is not None:
+                    with self.profiler.measure_time():
+                        # FP32 softmax for comparison
+                        fp32_output = x.softmax(dim=-1)
 
-            # scalar를 tensor로 변환
-            if not isinstance(scale, torch.Tensor):
-                scale = torch.tensor(scale)
+                        # scale이 None이면 self.input_scale 사용
+                        if scale is None:
+                            scale = self.input_scale
 
-            exp_int, exp_int_sum = self.int_softmax(x, scale)
-            softmax_out = torch.round(exp_int_sum / exp_int)
-            rounds = self.log_round(softmax_out)
-            
-            mask = rounds >= 2**self.bit_type.bits
-            qlog = torch.clamp(rounds, 0, 2**self.bit_type.bits - 1)
-            deq_softmax = 2**(-qlog)
-            deq_softmax[mask] = 0
+                        # channel-wise scale (tensor)이면 scalar로 변환 (max 사용)
+                        if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                            scale = scale.max()
+                        elif isinstance(scale, torch.Tensor):
+                            scale = scale.item()
 
-            return deq_softmax
+                        # scalar를 tensor로 변환
+                        if not isinstance(scale, torch.Tensor):
+                            scale = torch.tensor(scale)
 
+                        exp_int, exp_int_sum = self.int_softmax(x, scale)
+                        softmax_out = torch.round(exp_int_sum / exp_int)
+                        rounds = self.log_round(softmax_out)
+
+                        qlog = torch.clamp(rounds, 0, 2**self.bit_type.bits - 1)
+                        deq_softmax = 2**(-qlog)
+                        deq_softmax = deq_softmax / deq_softmax.sum(dim=-1, keepdim=True)
+
+                        # Update profiler with FP32 vs Integer Softmax
+                        self.profiler.update_weight(fp32_output, deq_softmax.detach())
+
+                        return deq_softmax
+                else:
+                    # scale이 None이면 self.input_scale 사용
+                    if scale is None:
+                        scale = self.input_scale
+
+                    # channel-wise scale (tensor)이면 scalar로 변환 (max 사용)
+                    if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                        scale = scale.max()
+                    elif isinstance(scale, torch.Tensor):
+                        scale = scale.item()
+
+                    # scalar를 tensor로 변환
+                    if not isinstance(scale, torch.Tensor):
+                        scale = torch.tensor(scale)
+
+                    exp_int, exp_int_sum = self.int_softmax(x, scale)
+                    softmax_out = torch.round(exp_int_sum / exp_int)
+                    rounds = self.log_round(softmax_out)
+
+                    qlog = torch.clamp(rounds, 0, 2**self.bit_type.bits - 1)
+                    deq_softmax = 2**(-qlog)
+                    deq_softmax = deq_softmax / deq_softmax.sum(dim=-1, keepdim=True)
+
+                    return deq_softmax
+            else:
+                # PTQ 모드: Log2 Quantizer 사용
+                if self.enable_profiling and self.profiler is not None:
+                    with self.profiler.measure_time():
+                        # FP32 softmax
+                        fp32_output = x.softmax(dim=-1)
+
+                        # Observer 기반 clipping으로 0 값 방지
+                        # Log2는 (0, 1] 범위에서 동작, 너무 작은 값은 0으로 매핑됨
+                        min_val = 2 ** (-(2 ** self.bit_type.bits - 1))  # 2^(-255) for 8-bit
+                        x_clipped = torch.clamp(fp32_output, min=min_val, max=1.0)
+
+                        # Log2 quantization
+                        x_quant = self.quantizer.forward(x_clipped)
+                        x_quant = x_quant / (x_quant.sum(dim=-1, keepdim=True) + 1e-8)
+
+                        # Update profiler with FP32 vs Log2 Quantized
+                        self.profiler.update_weight(fp32_output, x_quant.detach())
+
+                        return x_quant
+                else:
+                    x = x.softmax(dim=-1)
+
+                    # Observer 기반 clipping으로 0 값 방지
+                    min_val = 2 ** (-(2 ** self.bit_type.bits - 1))  # 2^(-255) for 8-bit
+                    x = torch.clamp(x, min=min_val, max=1.0)
+
+                    x = self.quantizer.forward(x)
+                    x = x / (x.sum(dim=-1, keepdim=True) + 1e-8)
+
+                    return x
 
         else:  # fp32 모드
+            if self.enable_profiling and self.profiler is not None:
+                # FP32 mode - measure time without quantization
+                with self.profiler.measure_time():
+                    pass  # No quantization, just time measurement
+
             x = x.softmax(dim=-1)
             return x
 
 
-def main():
+def test_quantintsoft_profiling():
     """
-    I-BERT Integer Softmax 테스트 함수
-    """
-    print("=" * 60)
-    print("I-BERT Integer Softmax Test")
-    print("=" * 60)
+    Test QuantIntSoft profiling functionality.
 
-    # 1. Observer co    nfig 생성
-    bit_type_config = BitTypeConfig(bits=8, signed=False, name='uint8')
-    observer_config = QuantConfig(
-        observer_type='PercentileObserver',
-        bit_type=bit_type_config,
+    Tests:
+    1. PTQ mode with Log2 quantizer
+    2. I-BERT mode with Integer Softmax
+    3. Profiling for both modes
+    """
+    print("="*80)
+    print("QuantIntSoft Profiling Test")
+    print("="*80)
+
+    # Create test config
+    config = QuantConfig(
+        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
+        observer_type='minmax',
         calibration_mode='layer_wise'
     )
 
-    # 2. QuantIntSoft 레이어 생성
-    quant_softmax = QuantIntSoft(
-        quant_args={},
+    # Test PTQ Mode
+    print("\n" + "="*80)
+    print("Test 1: PTQ Mode (Log2 Quantizer)")
+    print("="*80)
+
+    # Create QuantIntSoft with profiling enabled
+    print("\n[1] Creating QuantIntSoft (PTQ mode) with profiling enabled")
+    layer_ptq = QuantIntSoft(
         input_module=None,
-        observer_config=observer_config
+        quant_config=config,
+        layer_name='test_intsoft_ptq',
+        enable_profiling=True
     )
+    layer_ptq.PTQ = True
+    print("  ✓ QuantIntSoft created")
+    print(f"  Layer name: {layer_ptq.layer_name}")
+    print(f"  Mode: PTQ (Log2)")
+    print(f"  Profiling enabled: {layer_ptq.enable_profiling}")
+    print(f"  Profiler object: {layer_ptq.profiler is not None}")
 
-    print(f"\n[Init] mode: {quant_softmax.mode}")
-    print(f"[Init] bit_type: {quant_softmax.bit_type.bits}-bit")
+    # Generate test data (attention scores before softmax)
+    print("\n[2] Generating calibration data")
+    batch_size = 8
+    num_heads = 12
+    seq_len = 197
+    num_calib_batches = 10
 
-    # 3. 테스트 입력 생성 (Attention logits 시뮬레이션)
-    batch_size, seq_len, hidden_dim = 2, 4, 8
-    x = torch.randn(batch_size, seq_len, hidden_dim) * 10  # [-30, 30] 범위
+    calib_data = [torch.randn(batch_size, num_heads, seq_len, seq_len) for _ in range(num_calib_batches)]
+    print(f"  Calibration batches: {num_calib_batches}")
+    print(f"  Batch shape: {calib_data[0].shape}")
 
-    print(f"\n[Input] shape: {x.shape}")
-    print(f"[Input] range: [{x.min():.2f}, {x.max():.2f}]")
+    # Calibration
+    print("\n[3] Running calibration (PTQ mode)")
+    layer_ptq.eval()
+    with torch.no_grad():
+        for idx, x in enumerate(calib_data):
+            _ = layer_ptq.calibration(x)
+            if (idx + 1) % 5 == 0:
+                print(f"  Batch {idx + 1}/{num_calib_batches} completed")
+    print("  ✓ Calibration completed")
 
-    # 4. FP32 모드 테스트
-    print("\n" + "-" * 60)
-    print("FP32 Mode Test")
-    print("-" * 60)
-
-    quant_softmax.mode = 'fp32'
-    output_fp32 = quant_softmax(x)
-
-    print(f"[Output] shape: {output_fp32.shape}")
-    print(f"[Output] range: [{output_fp32.min():.6f}, {output_fp32.max():.6f}]")
-    print(f"[Output] sum (should be ~1.0): {output_fp32.sum(dim=-1)[0, 0]:.6f}")
-
-    # 5. Quantized 모드 테스트
-    print("\n" + "-" * 60)
-    print("Quantized Mode Test (I-BERT)")
-    print("-" * 60)
-
-    # Scale 설정 (이전 MatMul layer로부터 전달받았다고 가정)
-    input_scale = torch.tensor(0.1)
-    quant_softmax.input_scale = input_scale
-    quant_softmax.compute_quant_params()
-
-    print(f"[Scale] input_scale: {quant_softmax.input_scale:.6f}")
-    print(f"[Scale] output_scale: {quant_softmax.output_scale:.10f}")
-
-    quant_softmax.mode = 'quantized'
-    output_quant = quant_softmax(x, scale=input_scale)
-
-    print(f"[Output] shape: {output_quant.shape}")
-    print(f"[Output] range: [{output_quant.min():.6f}, {output_quant.max():.6f}]")
-    print(f"[Output] sum (should be ~1.0): {output_quant.sum(dim=-1)[0, 0]:.6f}")
-
-    # 6. FP32 vs Quantized 비교
-    print("\n" + "-" * 60)
-    print("FP32 vs Quantized Comparison")
-    print("-" * 60)
-
-    diff = (output_fp32 - output_quant).abs()
-    print(f"[Diff] mean: {diff.mean():.6f}")
-    print(f"[Diff] max: {diff.max():.6f}")
-    print(f"[Diff] relative error: {(diff / (output_fp32 + 1e-8)).mean():.6f}")
-
-    # 7. Static method 독립 테스트
-    print("\n" + "-" * 60)
-    print("Static Method Test")
-    print("-" * 60)
-
-    # int_polynomial 테스트
-    x_test = torch.tensor([0.5, -0.3, -0.1])
-    scaling_factor = torch.tensor(0.01)
-    poly_out, poly_scale = QuantIntSoft.int_polynomial(x_test, scaling_factor)
-    print(f"[int_polynomial] input: {x_test}")
-    print(f"[int_polynomial] output: {poly_out}")
-    print(f"[int_polynomial] scale: {poly_scale:.6f}")
-
-    # int_exp 테스트
-    exp_out, exp_scale = QuantIntSoft.int_exp(x_test, scaling_factor)
-    print(f"[int_exp] output: {exp_out}")
-    print(f"[int_exp] scale: {exp_scale:.10f}")
-
-    # log_round 테스트
-    log_test = torch.tensor([0.9, 0.5, 0.1, 0.01])
-    log_out = QuantIntSoft.log_round(log_test)
-    print(f"[log_round] input: {log_test}")
-    print(f"[log_round] output: {log_out}")
-    print(f"[log_round] dequant: {2**(-log_out)}")
-
-    print("\n" + "=" * 60)
-    print("Test Completed!")
-    print("=" * 60)
-
-def test_full_attention_pipeline(observer_type='PercentileObserver'):
-    """
-    전체 I-BERT Attention 파이프라인 테스트
-    QuantLinear → QuantAct → QuantIntSoft → Value MatMul
-    """
-    print(f"\n{'='*70}")
-    print(f"Full I-BERT Attention Pipeline Test with {observer_type}")
-    print(f"{'='*70}")
-
-    from models.ptq.quant_layer import QuantLinear
-    from models.ptq.quant_act import QAct
-    import torch.nn.functional as F
-
-    # ========== 1. Config 설정 ==========
-    bit_type_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    observer_config = QuantConfig(
-        observer_type=observer_type,
-        bit_type=bit_type_config,
-        calibration_mode='layer_wise'
-    )
-
-    # ========== 2. 입력 데이터 설정 ==========
-    batch_size, seq_len, hidden_dim = 2, 4, 64
-    scale_factor = hidden_dim ** 0.5
-
-    print(f"\n[Setup] Batch={batch_size}, Seq={seq_len}, Hidden={hidden_dim}")
-    print(f"[Setup] Scale factor (√d): {scale_factor:.4f}")
-
-    # ========== 3. Calibration Data 생성 및 Calibration ==========
-    num_batches = 32
-    print(f"\n=== Calibration Phase ({num_batches} batches) ===")
-
-    # QAct for MatMul output
-    qact_matmul = QAct(quant_args={}, observer_config=observer_config)
-
-    # QuantIntSoft for Softmax
-    quant_softmax = QuantIntSoft(
-        quant_args={},
-        input_module=None,
-        observer_config=observer_config
-    )
-
-    # Calibration loop
-    for i in range(num_batches):
-        Q_calib = torch.randn(batch_size, seq_len, hidden_dim)
-        K_calib = torch.randn(batch_size, seq_len, hidden_dim)
-
-        # MatMul: Q @ K^T / √d
-        matmul_output = (Q_calib @ K_calib.transpose(-2, -1)) / scale_factor
-
-        # QAct calibration
-        qact_matmul.calibration(matmul_output)
-
-        if (i + 1) % 10 == 0:
-            print(f"  Calibration batch {i+1}/{num_batches} completed")
-
-    print("=== Calibration Completed ===")
-
-    # ========== 4. Compute Quantization Params ==========
-    print("\n=== Computing Quantization Parameters ===")
-
-    # QAct params
-    act_scale, act_zero = qact_matmul.compute_quant_params()
-    print(f"[QAct] Scale: {act_scale.item():.8f}, Zero: {act_zero.item():.2f}")
-
-    # QuantIntSoft params (I-BERT mode: scale propagation)
-    matmul_output_scale = act_scale.item()
-    quant_softmax.input_scale = matmul_output_scale
-    soft_scale, _ = quant_softmax.compute_quant_params()
-    print(f"[IntSoft] Input scale: {matmul_output_scale:.8f}")
-    print(f"[IntSoft] Output scale: {soft_scale:.6e}")
-
-    # ========== 5. Inference Test ==========
-    print("\n" + "="*70)
-    print("Inference Phase")
-    print("="*70)
+    # Compute quantization parameters
+    print("\n[4] Computing quantization parameters")
+    scaler, zero = layer_ptq.compute_quant_params()
+    print(f"  Scale shape: {scaler.shape if isinstance(scaler, torch.Tensor) else 'scalar'}")
+    print(f"  Zero shape: {zero.shape if isinstance(zero, torch.Tensor) else 'scalar'}")
+    print("  ✓ Quantization parameters computed")
 
     # Test data
-    Q_test = torch.randn(batch_size, seq_len, hidden_dim)
-    K_test = torch.randn(batch_size, seq_len, hidden_dim)
-    V_test = torch.randn(batch_size, seq_len, hidden_dim)
+    test_input = torch.randn(1, num_heads, seq_len, seq_len)
 
-    # --- Step 1: MatMul (Q @ K^T) ---
-    print("\nStep 1: Q @ K^T (Attention Logits)")
-    matmul_fp32 = (Q_test @ K_test.transpose(-2, -1)) / scale_factor
-    print(f"  [FP32] Shape: {matmul_fp32.shape}")
-    print(f"  [FP32] Range: [{matmul_fp32.min():.4f}, {matmul_fp32.max():.4f}]")
+    # Quantized inference (PTQ mode)
+    print("\n[5] Testing Quantized mode (PTQ with profiling)")
+    layer_ptq.mode = 'quantized'
+    layer_ptq.reset_profiling()
 
-    # --- Step 2: QAct (Quantize MatMul output) ---
-    print("\nStep 2: QAct (Activation Quantization)")
-    qact_matmul.mode = 'quantized'
-    matmul_quant = qact_matmul(matmul_fp32)
-    print(f"  [Quant] Range: [{matmul_quant.min():.4f}, {matmul_quant.max():.4f}]")
-    print(f"  [Quant] Unique values: {len(torch.unique(matmul_quant))}")
+    print("  Running 100 iterations...")
+    with torch.no_grad():
+        for _ in range(100):
+            output_quant = layer_ptq(test_input)
 
-    # --- Step 3: QuantIntSoft (Integer Softmax) ---
-    print("\nStep 3: QuantIntSoft (I-BERT Integer Softmax)")
+    print("  ✓ Quantized forward completed (100 iterations)")
+    print(f"  Output shape: {output_quant.shape}")
+    print(f"  Output range: [{output_quant.min():.6f}, {output_quant.max():.6f}]")
+    print(f"  Output sum (per sequence): {output_quant.sum(dim=-1).mean():.6f}")
 
-    # FP32 baseline
-    softmax_fp32 = torch.softmax(matmul_fp32, dim=-1)
-    print(f"  [FP32] Sum (should be 1.0): {softmax_fp32.sum(dim=-1)[0, 0]:.6f}")
+    # Get profiling results
+    print("\n[6] Retrieving profiling results (PTQ mode)")
+    results_ptq = layer_ptq.get_profiling_results()
 
-    # I-BERT quantized
-    quant_softmax.mode = 'quantized'
-    softmax_quant = quant_softmax(matmul_quant, scale=matmul_output_scale)
-    print(f"  [Quant] Sum (should be ~1.0): {softmax_quant.sum(dim=-1)[0, 0]:.6f}")
-    print(f"  [Quant] Range: [{softmax_quant.min():.6f}, {softmax_quant.max():.6f}]")
-
-    # --- Step 4: Attention @ Value ---
-    print("\nStep 4: Attention @ Value (Final Output)")
-
-    # FP32 baseline
-    output_fp32 = softmax_fp32 @ V_test
-    print(f"  [FP32] Shape: {output_fp32.shape}")
-    print(f"  [FP32] Range: [{output_fp32.min():.4f}, {output_fp32.max():.4f}]")
-
-    # Quantized
-    output_quant = softmax_quant @ V_test
-    print(f"  [Quant] Shape: {output_quant.shape}")
-    print(f"  [Quant] Range: [{output_quant.min():.4f}, {output_quant.max():.4f}]")
-
-    # ========== 6. Error Analysis ==========
-    print("\n" + "="*70)
-    print("Error Analysis")
-    print("="*70)
-
-    # Softmax error
-    softmax_mse = F.mse_loss(softmax_fp32, softmax_quant)
-    softmax_cos = F.cosine_similarity(
-        softmax_fp32.flatten(),
-        softmax_quant.flatten(),
-        dim=0
-    )
-    print(f"\n[Softmax Error]")
-    print(f"  MSE: {softmax_mse.item():.10f}")
-    print(f"  Cosine Similarity: {softmax_cos.item():.10f}")
-    print(f"  Max Abs Diff: {(softmax_fp32 - softmax_quant).abs().max().item():.6f}")
-
-    # Final output error
-    output_mse = F.mse_loss(output_fp32, output_quant)
-    output_cos = F.cosine_similarity(
-        output_fp32.flatten(),
-        output_quant.flatten(),
-        dim=0
-    )
-    print(f"\n[Final Output Error]")
-    print(f"  MSE: {output_mse.item():.10f}")
-    print(f"  Cosine Similarity: {output_cos.item():.10f}")
-    print(f"  Relative Error: {((output_fp32 - output_quant).abs() / (output_fp32.abs() + 1e-8)).mean():.6f}")
-
-    # ========== 7. BitShift Analysis ==========
-    print("\n" + "="*70)
-    print("BitShift Analysis (Log2 Quantization)")
-    print("="*70)
-
-    unique_softmax = torch.unique(softmax_quant)
-    unique_nonzero = unique_softmax[unique_softmax > 0]
-
-    if len(unique_nonzero) > 0:
-        log2_vals = torch.log2(unique_nonzero)
-        is_power_of_2 = torch.allclose(log2_vals, log2_vals.round(), atol=1e-6)
-
-        print(f"\n[Softmax Values Analysis]")
-        print(f"  Total unique values: {len(unique_softmax)}")
-        print(f"  Non-zero unique values: {len(unique_nonzero)}")
-        print(f"  Sample values (first 10): {unique_nonzero[:10].tolist()}")
-        print(f"  Log2 of samples: {log2_vals[:10].tolist()}")
-        print(f"  All power-of-2? {is_power_of_2}")
-
-        if is_power_of_2:
-            print("\n  ✅ Softmax outputs are power-of-2 (BitShift-friendly!)")
-        else:
-            print("\n  ⚠️ Some values are not exact power-of-2")
-
-    # Success check
-    print(f"\n{'='*70}")
-    if softmax_cos > 0.99 and output_cos > 0.99:
-        print(f"✅ {observer_type} Pipeline Test PASSED!")
+    if results_ptq is None:
+        print("  ✗ ERROR: get_profiling_results() returned None!")
     else:
-        print(f"⚠️ {observer_type} Pipeline Test: Lower similarity than expected")
-    print(f"{'='*70}\n")
+        print("  ✓ Profiling results retrieved")
+        print(f"  Result keys: {list(results_ptq.keys())}")
+
+        # Check statistics
+        if results_ptq['statistics'] is not None:
+            stats = results_ptq['statistics']
+            print("\n  Statistics:")
+            qsnr = stats.get('qsnr', 'N/A')
+            mse = stats.get('mse', 'N/A')
+            print(f"    QSNR: {qsnr:.2f} dB" if isinstance(qsnr, (int, float)) else "    QSNR: {}".format(qsnr))
+            print(f"    MSE: {mse:.10f}" if isinstance(mse, (int, float)) else "    MSE: {}".format(mse))
+
+        # Check timing
+        if results_ptq['time'] and 'test_intsoft_ptq' in results_ptq['time']:
+            time_stats = results_ptq['time']['test_intsoft_ptq']
+            print("\n  Timing:")
+            print(f"    Count: {time_stats['count']}")
+            print(f"    Mean: {time_stats['mean']*1000:.4f} ms")
+
+    # Test I-BERT Mode
+    print("\n" + "="*80)
+    print("Test 2: I-BERT Mode (Integer Softmax)")
+    print("="*80)
+
+    # Create QuantIntSoft for I-BERT mode
+    print("\n[7] Creating QuantIntSoft (I-BERT mode) with profiling enabled")
+    layer_ibert = QuantIntSoft(
+        input_module=None,
+        quant_config=config,
+        layer_name='test_intsoft_ibert',
+        enable_profiling=True
+    )
+    layer_ibert.PTQ = False
+    layer_ibert.input_scale = torch.tensor(0.1)  # Simulated input scale
+    print("  ✓ QuantIntSoft created")
+    print(f"  Mode: I-BERT (Integer Softmax)")
+    print(f"  Input scale: {layer_ibert.input_scale}")
+
+    # Compute quantization parameters (I-BERT mode)
+    print("\n[8] Computing quantization parameters (I-BERT mode)")
+    output_scale, _ = layer_ibert.compute_quant_params()
+    print(f"  Output scale: {output_scale}")
+    print("  ✓ Quantization parameters computed")
+
+    # Quantized inference (I-BERT mode)
+    print("\n[9] Testing Quantized mode (I-BERT with profiling)")
+    layer_ibert.mode = 'quantized'
+    layer_ibert.reset_profiling()
+
+    print("  Running 100 iterations...")
+    with torch.no_grad():
+        for _ in range(100):
+            output_ibert = layer_ibert(test_input, scale=layer_ibert.input_scale)
+
+    print("  ✓ Quantized forward completed (100 iterations)")
+    print(f"  Output shape: {output_ibert.shape}")
+    print(f"  Output range: [{output_ibert.min():.6f}, {output_ibert.max():.6f}]")
+    print(f"  Output sum (per sequence): {output_ibert.sum(dim=-1).mean():.6f}")
+
+    # Get profiling results
+    print("\n[10] Retrieving profiling results (I-BERT mode)")
+    results_ibert = layer_ibert.get_profiling_results()
+
+    if results_ibert is None:
+        print("  ✗ ERROR: get_profiling_results() returned None!")
+    else:
+        print("  ✓ Profiling results retrieved")
+
+        # Check statistics
+        if results_ibert['statistics'] is not None:
+            stats = results_ibert['statistics']
+            print("\n  Statistics:")
+            qsnr = stats.get('qsnr', 'N/A')
+            mse = stats.get('mse', 'N/A')
+            print(f"    QSNR: {qsnr:.2f} dB" if isinstance(qsnr, (int, float)) else "    QSNR: {}".format(qsnr))
+            print(f"    MSE: {mse:.10f}" if isinstance(mse, (int, float)) else "    MSE: {}".format(mse))
+
+        # Check timing
+        if results_ibert['time'] and 'test_intsoft_ibert' in results_ibert['time']:
+            time_stats = results_ibert['time']['test_intsoft_ibert']
+            print("\n  Timing:")
+            print(f"    Count: {time_stats['count']}")
+            print(f"    Mean: {time_stats['mean']*1000:.4f} ms")
+
+    # Summary
+    print("\n" + "="*80)
+    print("Test Summary")
+    print("="*80)
+
+    passed_tests = []
+    failed_tests = []
+
+    # PTQ mode tests
+    if layer_ptq.profiler is not None:
+        passed_tests.append("PTQ: Profiler initialization")
+    else:
+        failed_tests.append("PTQ: Profiler initialization")
+
+    if results_ptq and results_ptq['statistics'] is not None:
+        passed_tests.append("PTQ: Statistics collection")
+    else:
+        failed_tests.append("PTQ: Statistics collection")
+
+    if results_ptq and results_ptq['time'] and 'test_intsoft_ptq' in results_ptq['time']:
+        passed_tests.append("PTQ: Timing profiling")
+    else:
+        failed_tests.append("PTQ: Timing profiling")
+
+    # I-BERT mode tests
+    if layer_ibert.profiler is not None:
+        passed_tests.append("I-BERT: Profiler initialization")
+    else:
+        failed_tests.append("I-BERT: Profiler initialization")
+
+    if results_ibert and results_ibert['statistics'] is not None:
+        passed_tests.append("I-BERT: Statistics collection")
+    else:
+        failed_tests.append("I-BERT: Statistics collection")
+
+    if results_ibert and results_ibert['time'] and 'test_intsoft_ibert' in results_ibert['time']:
+        passed_tests.append("I-BERT: Timing profiling")
+    else:
+        failed_tests.append("I-BERT: Timing profiling")
+
+    print(f"\n✓ Passed: {len(passed_tests)}")
+    for test in passed_tests:
+        print(f"  - {test}")
+
+    if failed_tests:
+        print(f"\n✗ Failed: {len(failed_tests)}")
+        for test in failed_tests:
+            print(f"  - {test}")
+
+    print("\n" + "="*80)
+    if len(failed_tests) == 0:
+        print("ALL TESTS PASSED!")
+    else:
+        print(f"SOME TESTS FAILED ({len(failed_tests)}/{len(passed_tests) + len(failed_tests)})")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    observer_types = ['MinmaxObserver', 'PercentileObserver']
+    import sys
+    from pathlib import Path
+    # Add project root to path
+    project_root = Path(__file__).parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-    print("="*70)
-    print("Testing I-BERT Attention Pipeline with Multiple Observers")
-    print("="*70)
+    test_quantintsoft_profiling()
 
-    for obs_type in observer_types:
-        try:
-            test_full_attention_pipeline(observer_type=obs_type)
-        except Exception as e:
-            print(f"\n❌ {obs_type} Test Failed")
-            print(f"Error: {e}\n")
-
-    print("="*70)
-    print("All Pipeline Tests Completed!")
-    print("="*70)

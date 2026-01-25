@@ -1,0 +1,17 @@
+# Activation Quantization Configuration
+# Activation quantization settings for intermediate outputs
+
+# ==================== Global Default Configuration ====================
+default:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    signed: true
+    name: int8
+  observer_type: PercnetileObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9995
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+

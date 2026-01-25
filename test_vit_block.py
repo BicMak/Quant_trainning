@@ -147,6 +147,46 @@ def test_vit_block(
     print(f"  Quantized layers: {list(quant_block.get_quantized_layers().keys())}")
     print("  Profiling: ENABLED")
 
+    # ========== 3.1. FQ-ViT 구현 완성도 검증 ==========
+    print(f"\n[Verifying FQ-ViT Implementation]")
+
+    # attn_v_output (qact2) 검증
+    print(f"\n  [1] attn_v_output Layer (FQ-ViT qact2)")
+    if hasattr(quant_block, 'attn_v_output'):
+        print(f"    ✓ attn_v_output layer exists")
+        if 'attn_v_output' in quant_block.get_quantized_layers():
+            print(f"    ✓ attn_v_output in get_quantized_layers()")
+        if 'attn_v_output' in quant_block.profilers:
+            print(f"    ✓ attn_v_output profiler exists")
+    else:
+        print(f"    ✗ attn_v_output layer does NOT exist!")
+
+    # Integer LayerNorm 검증
+    print(f"\n  [2] Integer LayerNorm (FQ-ViT)")
+    if hasattr(quant_block.norm1, '_integer_layernorm'):
+        print(f"    ✓ norm1 has Integer LayerNorm method")
+        print(f"    → Mode: {quant_block.norm1.mode}")
+    else:
+        print(f"    ✗ norm1 does NOT have Integer LayerNorm")
+
+    if hasattr(quant_block.norm2, '_integer_layernorm'):
+        print(f"    ✓ norm2 has Integer LayerNorm method")
+        print(f"    → Mode: {quant_block.norm2.mode}")
+    else:
+        print(f"    ✗ norm2 does NOT have Integer LayerNorm")
+
+    # IntSoftmax PTQ 모드 검증
+    print(f"\n  [3] IntSoftmax Configuration")
+    if hasattr(quant_block.intSoft, 'PTQ'):
+        print(f"    ✓ IntSoft has PTQ mode")
+        print(f"    → PTQ mode: {quant_block.intSoft.PTQ}")
+        if quant_block.intSoft.PTQ:
+            print(f"    → Using Log2 Quantizer with Observer")
+        else:
+            print(f"    → Using I-BERT Integer Softmax")
+    else:
+        print(f"    ✗ IntSoft does NOT have PTQ mode")
+
     # ========== 4. 실제 데이터셋에서 Calibration 데이터 로드 ==========
     print(f"\n{'='*80}")
     print("Loading Calibration Data from ImageNet-Mini")
@@ -256,6 +296,23 @@ def test_vit_block(
                 else:
                     print(f"    Output scale: {layer.output_scaler:.8f}")
 
+    # ========== 8.1. attn_v_output 양자화 파라미터 검증 ==========
+    print(f"\n[attn_v_output Quantization Parameters (FQ-ViT qact2)]")
+    if hasattr(quant_block, 'attn_v_output') and hasattr(quant_block.attn_v_output, 'scaler'):
+        layer = quant_block.attn_v_output
+        if isinstance(layer.scaler, torch.Tensor):
+            if layer.scaler.numel() == 1:
+                print(f"  ✓ attn_v_output scale: {layer.scaler.item():.8f}")
+            else:
+                print(f"  ✓ attn_v_output scale (mean): {layer.scaler.mean().item():.8f} (shape: {layer.scaler.shape})")
+        else:
+            print(f"  ✓ attn_v_output scale: {layer.scaler:.8f}")
+        print(f"  → This layer quantizes Attention @ Value output (INT32 → INT8)")
+        print(f"  → Critical for FQ-ViT accuracy!")
+    else:
+        print(f"  ✗ attn_v_output scale NOT computed!")
+        print(f"  WARNING: Missing quantization parameter for FQ-ViT qact2!")
+
     # ========== 9. FP32 vs Quantized Inference 비교 ==========
     print(f"\n{'='*80}")
     print("Inference Comparison (First ViT Block)")
@@ -295,6 +352,24 @@ def test_vit_block(
     # Quantized 프로파일링 결과
     print("\n[Quantized Block - Profiling Results]")
     quant_block.print_profiling_summary()
+
+    # ========== 9.1. attn_v_output 프로파일링 검증 ==========
+    print("\n[attn_v_output Profiling Verification (FQ-ViT qact2)]")
+    prof_results = quant_block.get_profiling_results()
+    if 'attn_v_output' in prof_results:
+        attn_v_result = prof_results['attn_v_output']
+        if 'time' in attn_v_result and 'attn_v_output' in attn_v_result['time']:
+            time_info = attn_v_result['time']['attn_v_output']
+            print(f"  ✓ attn_v_output profiled successfully")
+            print(f"    - Count: {time_info['count']} calls")
+            print(f"    - Mean time: {time_info['mean']*1000:.4f} ms")
+            print(f"  → Attention @ Value output is being quantized (INT32 → INT8)")
+            print(f"  → FQ-ViT qact2 layer is active!")
+        else:
+            print(f"  ✓ attn_v_output in profiling results but no timing data")
+    else:
+        print(f"  ✗ attn_v_output NOT in profiling results!")
+        print(f"  WARNING: FQ-ViT qact2 layer may not be executing!")
 
     # ========== 10. 모든 레이어 통계 업데이트 ==========
     print(f"\n{'='*80}")

@@ -1,0 +1,76 @@
+================================================================================
+QuantAttention Test Report
+================================================================================
+
+Timestamp: 20260125_133606
+Config: /home/hellboy/Quant_trainning/configs
+Calibration samples: 600
+
+Per-Layer Metrics:
+--------------------------------------------------------------------------------
+
+qkv:
+  MSE:               0.5584717989
+  L2 Error:          2245.414551
+  Cosine Similarity: 0.7631983161
+  QSNR:              -2.75 dB
+  Max Abs Diff:      2.737799
+  Rel Error:         15.955482
+
+qkv_output:
+  MSE:               0.5584718585
+  L2 Error:          2245.413330
+  Cosine Similarity: 0.7631984353
+  QSNR:              -2.75 dB
+  Max Abs Diff:      2.737832
+  Rel Error:         15.955499
+
+attn_act:
+  MSE:               0.6516041756
+  L2 Error:          2450.480469
+  Cosine Similarity: 0.5887928605
+  QSNR:              -8.84 dB
+  Max Abs Diff:      2.385121
+  Rel Error:         32.117985
+
+softmax:
+  MSE:               0.0000119984
+  L2 Error:          10.515854
+  Cosine Similarity: 0.8415044546
+  QSNR:              3.58 dB
+  Max Abs Diff:      0.122891
+  Rel Error:         0.487660
+
+attn_v_output:
+  MSE:               0.1388110965
+  L2 Error:          646.419739
+  Cosine Similarity: 0.7577514648
+  QSNR:              -0.54 dB
+  Max Abs Diff:      1.994601
+  Rel Error:         17.099339
+
+proj:
+  MSE:               0.0563770905
+  L2 Error:          411.964905
+  Cosine Similarity: 0.5940803885
+  QSNR:              -1.67 dB
+  Max Abs Diff:      1.310137
+  Rel Error:         14.822597
+
+proj_output:
+  MSE:               0.0563575439
+  L2 Error:          411.893646
+  Cosine Similarity: 0.5940757990
+  QSNR:              -1.67 dB
+  Max Abs Diff:      1.310150
+  Rel Error:         14.822266
+
+================================================================================
+Final Output Metrics:
+--------------------------------------------------------------------------------
+  MSE:               0.0563575439
+  L2 Error:          411.893646
+  Cosine Similarity: 0.5940757990
+  QSNR:              -1.67 dB
+  Max Abs Diff:      1.310150
+  Rel Error:         14.822266

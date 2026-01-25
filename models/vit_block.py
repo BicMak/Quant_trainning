@@ -73,6 +73,11 @@ class QuantTimmVitBlock(nn.Module):
             quant_config=layer_config.get_config('kv_act'),
             act_module=None
         )
+        # attn_v_output: Attention @ Value 출력 양자화 (FQ-ViT qact2)
+        self.attn_v_output = QAct(
+            quant_config=layer_config.get_config('attn_v_output'),
+            act_module=None
+        )
         self.sv_attn= QAct(
             quant_config=layer_config.get_config('sv_attn'),
             act_module=None
@@ -142,7 +147,7 @@ class QuantTimmVitBlock(nn.Module):
         """Initialize profilers for each quantized layer"""
         layer_names = [
             'attn_qkv', 'attn_qkv_output', 'attn_proj',
-            'kv_act', 'sv_attn', 'intSoft',
+            'kv_act', 'attn_v_output', 'sv_attn', 'intSoft',
             'mlp_fc1', 'mlp_act', 'mlp_fc2', 'mlp_act2',
             'norm1', 'norm2',
             'residual1', 'residual2'
@@ -155,12 +160,18 @@ class QuantTimmVitBlock(nn.Module):
         # === Attention block ===
         B, N, C = x.shape
 
-        # norm1 → qkv
+        # norm1 → qkv (FQ-ViT style: pass quantizers for scale propagation)
+        # Note: norm1의 in_quantizer는 이전 블록의 출력이므로 None으로 처리
+        # out_quantizer는 attn_qkv_output의 quantizer 사용
         if self.enable_profiling:
             with self.profilers['norm1'].measure_time():
-                x_norm = self.norm1.forward(x)
+                x_norm = self.norm1.forward(x,
+                    in_quantizer=None,
+                    out_quantizer=self.attn_qkv_output.quantizer if hasattr(self.attn_qkv_output, 'quantizer') else None)
         else:
-            x_norm = self.norm1.forward(x)
+            x_norm = self.norm1.forward(x,
+                in_quantizer=None,
+                out_quantizer=self.attn_qkv_output.quantizer if hasattr(self.attn_qkv_output, 'quantizer') else None)
 
         if self.enable_profiling:
             with self.profilers['attn_qkv'].measure_time():
@@ -200,6 +211,13 @@ class QuantTimmVitBlock(nn.Module):
         # Combine heads
         x_attn = (attn @ v).transpose(1, 2).reshape(B, N, C)
 
+        # Quantize Attention @ Value output (FQ-ViT qact2)
+        if self.enable_profiling:
+            with self.profilers['attn_v_output'].measure_time():
+                x_attn = self.attn_v_output.forward(x_attn)
+        else:
+            x_attn = self.attn_v_output.forward(x_attn)
+
         if self.enable_profiling:
             with self.profilers['attn_proj'].measure_time():
                 x_attn = self.attn_proj.forward(x_attn)
@@ -224,11 +242,16 @@ class QuantTimmVitBlock(nn.Module):
             x = self.residual1.forward(x)
 
         # === MLP block ===
+        # norm2: residual1 → norm2 → mlp (FQ-ViT style: scale propagation)
         if self.enable_profiling:
             with self.profilers['norm2'].measure_time():
-                x_norm = self.norm2.forward(x)
+                x_norm = self.norm2.forward(x,
+                    in_quantizer=self.residual1.quantizer if hasattr(self.residual1, 'quantizer') else None,
+                    out_quantizer=self.mlp_act.quantizer if hasattr(self.mlp_act, 'quantizer') else None)
         else:
-            x_norm = self.norm2.forward(x)
+            x_norm = self.norm2.forward(x,
+                in_quantizer=self.residual1.quantizer if hasattr(self.residual1, 'quantizer') else None,
+                out_quantizer=self.mlp_act.quantizer if hasattr(self.mlp_act, 'quantizer') else None)
 
         if self.enable_profiling:
             with self.profilers['mlp_fc1'].measure_time():
@@ -279,6 +302,7 @@ class QuantTimmVitBlock(nn.Module):
             # QAct layers
             'attn_qkv_output': self.attn_qkv_output,
             'kv_act': self.kv_act,
+            'attn_v_output': self.attn_v_output,
             'sv_attn': self.sv_attn,
             'residual1': self.residual1,
             'residual2': self.residual2,
@@ -317,6 +341,7 @@ class QuantTimmVitBlock(nn.Module):
         # Attn (S*V)
         # int8 -> int32 -> int8
         x_attn = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_attn = self.attn_v_output.calibration(x_attn)  # FQ-ViT qact2
         x_attn = self.attn_proj.calibration(x_attn)
         x_attn = self.sv_attn.calibration(x_attn)
         x_attn = self.proj_drop(x_attn)
@@ -910,7 +935,7 @@ class QuantTimmVitBlock(nn.Module):
                             valid_sqnr.append((layer_name, sqnr))
                         if kl is not None:
                             valid_kl.append((layer_name, kl))
-                    except:
+                    except Exception:
                         pass
 
             if valid_sqnr:
@@ -1039,6 +1064,282 @@ class QuantTimmVitBlock(nn.Module):
                 continue
 
         print(f"Saved {len(saved_files)} histogram images to: {log_dir}")
+        return saved_files
+
+    def save_block_logs(self, base_log_dir: Union[str, Path] = None):
+        """
+        Save all profiling results to a dated folder.
+        Creates log/YYYYMMDD_blocklog/ directory and saves:
+        - Profiling report (txt)
+        - All layer histograms (jpeg)
+
+        Args:
+            base_log_dir: Base log directory. Defaults to 'log' at project root.
+
+        Returns:
+            Path to the created log folder
+        """
+        if not self.enable_profiling:
+            print("Profiling is not enabled")
+            return None
+
+        # Create base log directory
+        if base_log_dir is None:
+            base_log_dir = Path(__file__).parent.parent / 'log'
+        else:
+            base_log_dir = Path(base_log_dir)
+
+        # Create dated folder
+        date_str = datetime.now().strftime("%Y%m%d")
+        log_folder = base_log_dir / f"{date_str}_blocklog"
+        log_folder.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "="*80)
+        print("Saving Block Profiling Logs")
+        print("="*80)
+        print(f"Log directory: {log_folder}")
+
+        # Generate timestamp for filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 1. Save profiling report
+        report_path = log_folder / f"profiling_report_{timestamp}.txt"
+        self._save_profiling_report_to_path(report_path)
+        print(f"\n[1/2] Profiling report saved: {report_path.name}")
+
+        # 2. Save all histograms
+        histogram_files = self._save_histograms_to_folder(log_folder, timestamp)
+        print(f"[2/2] Histogram images saved: {len(histogram_files)} files")
+
+        print("\n" + "="*80)
+        print(f"All logs saved to: {log_folder}")
+        print("="*80)
+
+        return log_folder
+
+    def _save_profiling_report_to_path(self, report_path: Path):
+        """Internal: Save profiling report to specific path"""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("ViT Block Quantization Profiling Report")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 80)
+
+        # Layer categories
+        weight_layers = ['attn_qkv', 'attn_proj', 'mlp_fc1', 'mlp_fc2']
+        activation_layers = [
+            'norm1', 'attn_qkv_output', 'kv_act', 'intSoft', 'sv_attn',
+            'residual1', 'norm2', 'mlp_act', 'mlp_act2', 'residual2'
+        ]
+
+        # Weight layers statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("WEIGHT QUANTIZATION STATISTICS")
+        lines.append("=" * 80)
+
+        for layer_name in weight_layers:
+            if layer_name not in self.profilers:
+                continue
+
+            try:
+                stats = self.profilers[layer_name].get_statistic()
+                hist = self.profilers[layer_name].get_hist()
+
+                lines.append(f"\n[{layer_name}]")
+                lines.append("-" * 40)
+
+                mse = stats.get('mse', None)
+                lines.append(f"  MSE:               {mse:.10f}" if mse is not None else "  MSE:               N/A")
+
+                sqnr = stats.get('qsnr', None)
+                lines.append(f"  SQNR:              {sqnr:.4f} dB" if sqnr is not None else "  SQNR:              N/A")
+
+                cos_sim = stats.get('cosine_sim', None)
+                lines.append(f"  Cosine Similarity: {cos_sim:.10f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+
+                kl_div = hist.get('kl_divergence', None)
+                lines.append(f"  KL Divergence:     {kl_div:.10f}" if kl_div is not None else "  KL Divergence:     N/A")
+
+                js_div = hist.get('js_divergence', None)
+                lines.append(f"  JS Divergence:     {js_div:.10f}" if js_div is not None else "  JS Divergence:     N/A")
+
+                orig_range = hist.get('original_range', (None, None))
+                lines.append(f"  FP32 Range:        [{orig_range[0]:.6f}, {orig_range[1]:.6f}]" if orig_range[0] is not None else "  FP32 Range:        N/A")
+
+                quant_range = hist.get('quantized_range', (None, None))
+                lines.append(f"  Quant Range:       [{quant_range[0]:.6f}, {quant_range[1]:.6f}]" if quant_range[0] is not None else "  Quant Range:       N/A")
+
+            except Exception as e:
+                lines.append(f"\n[{layer_name}]")
+                lines.append(f"  Error: {str(e)}")
+
+        # Activation layers statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("ACTIVATION QUANTIZATION STATISTICS")
+        lines.append("=" * 80)
+
+        for layer_name in activation_layers:
+            if layer_name not in self.profilers:
+                continue
+
+            try:
+                stats = self.profilers[layer_name].get_statistic()
+                hist = self.profilers[layer_name].get_hist()
+
+                lines.append(f"\n[{layer_name}]")
+                lines.append("-" * 40)
+
+                mse = stats.get('mse', None)
+                lines.append(f"  MSE:               {mse:.10f}" if mse is not None else "  MSE:               N/A")
+
+                sqnr = stats.get('qsnr', None)
+                lines.append(f"  SQNR:              {sqnr:.4f} dB" if sqnr is not None else "  SQNR:              N/A")
+
+                cos_sim = stats.get('cosine_sim', None)
+                lines.append(f"  Cosine Similarity: {cos_sim:.10f}" if cos_sim is not None else "  Cosine Similarity: N/A")
+
+                kl_div = hist.get('kl_divergence', None)
+                lines.append(f"  KL Divergence:     {kl_div:.10f}" if kl_div is not None else "  KL Divergence:     N/A")
+
+                js_div = hist.get('js_divergence', None)
+                lines.append(f"  JS Divergence:     {js_div:.10f}" if js_div is not None else "  JS Divergence:     N/A")
+
+                orig_range = hist.get('original_range', (None, None))
+                lines.append(f"  FP32 Range:        [{orig_range[0]:.6f}, {orig_range[1]:.6f}]" if orig_range[0] is not None else "  FP32 Range:        N/A")
+
+                quant_range = hist.get('quantized_range', (None, None))
+                lines.append(f"  Quant Range:       [{quant_range[0]:.6f}, {quant_range[1]:.6f}]" if quant_range[0] is not None else "  Quant Range:       N/A")
+
+            except Exception as e:
+                lines.append(f"\n[{layer_name}]")
+                lines.append(f"  Error: {str(e)}")
+
+        # Summary statistics
+        lines.append("\n" + "=" * 80)
+        lines.append("SUMMARY")
+        lines.append("=" * 80)
+
+        try:
+            all_layers = weight_layers + activation_layers
+            valid_sqnr = []
+            valid_kl = []
+
+            for layer_name in all_layers:
+                if layer_name in self.profilers:
+                    try:
+                        stats = self.profilers[layer_name].get_statistic()
+                        hist = self.profilers[layer_name].get_hist()
+                        sqnr = stats.get('qsnr', None)
+                        kl = hist.get('kl_divergence', None)
+                        if sqnr is not None:
+                            valid_sqnr.append((layer_name, sqnr))
+                        if kl is not None:
+                            valid_kl.append((layer_name, kl))
+                    except Exception:
+                        pass
+
+            if valid_sqnr:
+                avg_sqnr = sum(s[1] for s in valid_sqnr) / len(valid_sqnr)
+                min_sqnr = min(valid_sqnr, key=lambda x: x[1])
+                max_sqnr = max(valid_sqnr, key=lambda x: x[1])
+
+                lines.append(f"\n  Average SQNR:      {avg_sqnr:.4f} dB")
+                lines.append(f"  Best SQNR:         {max_sqnr[0]} ({max_sqnr[1]:.4f} dB)")
+                lines.append(f"  Worst SQNR:        {min_sqnr[0]} ({min_sqnr[1]:.4f} dB)")
+
+            if valid_kl:
+                avg_kl = sum(k[1] for k in valid_kl) / len(valid_kl)
+                min_kl = min(valid_kl, key=lambda x: x[1])
+                max_kl = max(valid_kl, key=lambda x: x[1])
+
+                lines.append(f"\n  Average KL Div:    {avg_kl:.6f}")
+                lines.append(f"  Best KL Div:       {min_kl[0]} ({min_kl[1]:.6f})")
+                lines.append(f"  Worst KL Div:      {max_kl[0]} ({max_kl[1]:.6f})")
+
+        except Exception as e:
+            lines.append(f"\n  Summary Error: {str(e)}")
+
+        lines.append("\n" + "=" * 80)
+        lines.append("END OF REPORT")
+        lines.append("=" * 80)
+
+        # Write to file
+        with open(report_path, 'w') as f:
+            f.write('\n'.join(lines))
+
+    def _save_histograms_to_folder(self, log_folder: Path, timestamp: str):
+        """Internal: Save all layer histograms to folder"""
+        saved_files = []
+        all_layers = list(self.profilers.keys())
+
+        for layer_name in all_layers:
+            try:
+                hist_data = self.profilers[layer_name].get_hist()
+                stats = self.profilers[layer_name].get_statistic()
+
+                orig_hist = hist_data['original_hist'].numpy()
+                quant_hist = hist_data['quantized_hist'].numpy()
+                orig_range = hist_data['original_range']
+                quant_range = hist_data['quantized_range']
+
+                # Normalize histograms
+                orig_hist_norm = orig_hist / (orig_hist.sum() + 1e-10)
+                quant_hist_norm = quant_hist / (quant_hist.sum() + 1e-10)
+
+                # Create bin edges
+                min_val = min(orig_range[0], quant_range[0])
+                max_val = max(orig_range[1], quant_range[1])
+                bins = np.linspace(min_val, max_val, len(orig_hist) + 1)
+                bin_centers = (bins[:-1] + bins[1:]) / 2
+
+                # Create figure
+                fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+
+                ax.bar(bin_centers, orig_hist_norm, width=(bins[1]-bins[0])*0.8,
+                       alpha=0.6, label='FP32', color='blue')
+                ax.bar(bin_centers, quant_hist_norm, width=(bins[1]-bins[0])*0.8,
+                       alpha=0.6, label='Quantized', color='red')
+
+                # Statistics text
+                kl_div = hist_data.get('kl_divergence', 0)
+                js_div = hist_data.get('js_divergence', 0)
+                sqnr = stats.get('qsnr', 0)
+                mse = stats.get('mse', 0)
+                cos_sim = stats.get('cosine_sim', 0)
+
+                stats_text = (
+                    f"MSE: {mse:.6f}\n"
+                    f"SQNR: {sqnr:.2f} dB\n"
+                    f"Cosine Sim: {cos_sim:.6f}\n"
+                    f"KL Div: {kl_div:.6f}\n"
+                    f"JS Div: {js_div:.6f}"
+                )
+
+                ax.text(0.98, 0.97, stats_text, transform=ax.transAxes,
+                       verticalalignment='top', horizontalalignment='right',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                       fontsize=10, family='monospace')
+
+                ax.set_xlabel('Value', fontsize=12)
+                ax.set_ylabel('Probability Density', fontsize=12)
+                ax.set_title(f'{layer_name} - FP32 vs Quantized Distribution', fontsize=14)
+                ax.legend(loc='upper left', fontsize=10)
+                ax.grid(True, alpha=0.3)
+                ax.set_yscale('log')
+
+                plt.tight_layout()
+
+                # Save as JPEG
+                save_path = log_folder / f"hist_{layer_name}_{timestamp}.jpg"
+                plt.savefig(save_path, format='jpeg', dpi=150, bbox_inches='tight')
+                plt.close()
+
+                saved_files.append(save_path)
+
+            except Exception as e:
+                print(f"  Warning: Could not save histogram for {layer_name}: {str(e)}")
+                continue
+
         return saved_files
 
 
@@ -1227,22 +1528,8 @@ def test_vit_block(config_path: Union[str, Path] = None, save_logs: bool = True)
 
     # ========== 9. 로그 저장 ==========
     if save_logs:
-        print(f"\n{'='*80}")
-        print("Saving Profiling Logs")
-        print("="*80)
-
-        # log 폴더 경로
-        log_dir = Path(__file__).parent.parent / 'log'
-
-        # 통계 리포트 저장 (txt)
-        report_path = quant_block.save_profiling_report(log_dir)
-
-        # 히스토그램 저장 (jpeg)
-        histogram_files = quant_block.save_all_histograms(log_dir)
-
-        print(f"\n  Log directory: {log_dir}")
-        print(f"  Report file: {report_path}")
-        print(f"  Histogram files: {len(histogram_files)} images saved")
+        # 날짜별 폴더에 모든 로그 저장 (log/YYYYMMDD_blocklog/)
+        log_folder = quant_block.save_block_logs()
 
     # ========== 10. Error Analysis ==========
     print(f"\n{'='*80}")
@@ -1307,8 +1594,8 @@ def test_vit_block(config_path: Union[str, Path] = None, save_logs: bool = True)
         print(f"   - QSNR: {qsnr.item():.2f} dB")
     print("="*80)
 
-    if save_logs:
-        print(f"\nProfiling results saved to: {log_dir}")
+    if save_logs and log_folder:
+        print(f"\nProfiling results saved to: {log_folder}")
 
 
 if __name__ == "__main__":

@@ -9,16 +9,20 @@ from quant_config import QuantConfig, BitTypeConfig
 from .bit_type import BitType
 from .layer_quantizer.build import build_quantizer
 from .utils import init_observers
+from .layer_profiler.profiler import profiler
 
 class QuantLinear(nn.Module):
     def __init__(self,
                  input_module: nn.Module,
                  quant_config: QuantConfig,
-                 ):
+                 layer_name: str = 'qlinear',
+                 enable_profiling: bool = False):
         super().__init__()
 
         # quant_config에서 설정 추출
         self.input_module = input_module
+        self.layer_name = layer_name
+        self.enable_profiling = enable_profiling
         self.quant_config = quant_config
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
@@ -26,15 +30,23 @@ class QuantLinear(nn.Module):
             signed=quant_config.bit_type.signed,
             name=quant_config.bit_type.name
         )
+
+        # Hardcoded weight bit type (signed=True for weights)
+        self.weight_bit_type = BitType(
+            bits=quant_config.bit_type.bits,
+            signed=True,  # Hardcoded for weights
+            name=f"int{quant_config.bit_type.bits}_weight"
+        )
+
         self.calibration_mode = quant_config.calibration_mode
         self.quant_weight = None
         self.mode = 'fp32'
 
 
-        #1. set layer type & observer
-        self.observer = init_observers(self.observer_type,
-                                        self.bit_type,
-                                        'linear_weight',
+        #1. set layer type & observer, fix minmax
+        self.observer = init_observers("MinmaxObserver",  # Hardcoded
+                                        self.weight_bit_type,  # Hardcoded signed=True
+                                        'linear_weight',  # Hardcoded
                                         self.calibration_mode,
                                         self.quant_config)
         # output_observer는 별도로 초기화 (activation 타입으로)
@@ -47,14 +59,21 @@ class QuantLinear(nn.Module):
         #2. quantizer build
         self.quantizer = build_quantizer(
             quantizer_str='uniform',
-            bit_type=self.bit_type,
+            bit_type=self.weight_bit_type,  # Use hardcoded weight bit type
             module_type='linear_weight')
         self.output_quantizer = build_quantizer(
             quantizer_str='uniform',
             bit_type=self.bit_type,
             module_type='activation')  # output은 activation type
 
-        #2. layer initialization  
+        #3. profiler 초기화
+        self.profiler = None
+        self.weight_profiler = None
+        if self.enable_profiling:
+            self.profiler = profiler(layer_name + '_output')
+            self.weight_profiler = profiler(layer_name + '_weight')
+
+        #4. layer initialization
         self.fwd_kwargs = dict()
         self.fwd_func = F.linear
 
@@ -109,291 +128,464 @@ class QuantLinear(nn.Module):
             max=self.bit_type.upper_bound
         )
 
+        # profiler에 weight 업데이트 (FP32 vs Quantized weight 비교)
+        if self.enable_profiling and self.weight_profiler is not None:
+            # Manual dequantization: (quant_weight - zero) * scale
+            # quant_weight is already integer values, so we need to dequantize properly
+            dequant_weight = (self.quant_weight - zero_reshaped) * scaler_reshaped
+            self.weight_profiler.update_weight(self.weight, dequant_weight.detach())
+
         return (self.scaler, self.zero), (self.output_scaler, self.output_zero)
+
+    def get_profiler(self):
+        """Get profiler objects (output and weight)"""
+        if self.enable_profiling:
+            return {
+                'output': self.profiler,
+                'weight': self.weight_profiler
+            }
+        return None
+
+    def get_profiling_results(self):
+        """
+        Get all profiling results after forward pass.
+
+        Returns:
+            dict: Dictionary containing statistics, histogram, time, and memory records
+                  for both output and weight quantization
+                  Returns None if profiling is not enabled
+
+        Usage:
+            layer.forward(x)  # Automatically updates profiler
+            results = layer.get_profiling_results()
+            print(results['output']['statistics']['qsnr'])
+            print(results['weight']['statistics']['qsnr'])
+        """
+        if not self.enable_profiling:
+            return None
+
+        results = {}
+
+        # Output profiling results
+        if self.profiler is not None:
+            try:
+                output_stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
+                output_hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+            except (ValueError, AttributeError):
+                output_stats = None
+                output_hist = None
+
+            results['output'] = {
+                'statistics': output_stats,
+                'histogram': output_hist,
+                'time': self.profiler.get_time_record(),
+                'memory': self.profiler.get_memory_record()
+            }
+
+        # Weight profiling results
+        if self.weight_profiler is not None:
+            try:
+                weight_stats = self.weight_profiler.get_statistic() if self.weight_profiler.weight is not None else None
+                weight_hist = self.weight_profiler.get_hist() if self.weight_profiler.weight is not None else None
+            except (ValueError, AttributeError):
+                weight_stats = None
+                weight_hist = None
+
+            results['weight'] = {
+                'statistics': weight_stats,
+                'histogram': weight_hist,
+                'time': self.weight_profiler.get_time_record(),
+                'memory': self.weight_profiler.get_memory_record()
+            }
+
+        return results
+
+    def reset_profiling(self):
+        """Reset profiling data for both output and weight"""
+        if self.enable_profiling:
+            if self.profiler is not None:
+                self.profiler.reset_time_profiler()
+                self.profiler.reset_memory_profiler()
+                self.profiler.weight = None
+                self.profiler.quant_weight = None
+
+            if self.weight_profiler is not None:
+                self.weight_profiler.reset_time_profiler()
+                self.weight_profiler.reset_memory_profiler()
+                self.weight_profiler.weight = None
+                self.weight_profiler.quant_weight = None
 
 
     def forward(self, x):
         # in inference x input is int8 tensor
 
         if self.mode == 'quantized':
-            
-            # 1. dequantize weights (int8 -> fp32)
-            dequant_weight = self.quantizer.forward(self.quant_weight)
+            if self.enable_profiling and self.profiler is not None:
+                # Measure quantization time
+                with self.profiler.measure_time():
+                    # 1. dequantize weights (int8 -> fp32)
+                    dequant_weight = self.quantizer.forward(self.quant_weight)
 
-            # 2. fake quantization in fp32
-            x = self.fwd_func(x,dequant_weight, self.bias, **self.fwd_kwargs)
-            
-            # 3. Output fake quantization
-            x = self.output_quantizer.forward(x)
-            
+                    # 2. Linear operation in fp32
+                    out_fp32 = self.fwd_func(x, dequant_weight, self.bias, **self.fwd_kwargs)
+
+                    # Store FP32 output before quantization
+                    fp32_output = out_fp32.clone().detach()
+
+                    # 3. Output fake quantization
+                    x = self.output_quantizer.forward(out_fp32)
+
+                    # Update profiler with FP32 vs Quantized outputs
+                    self.profiler.update_weight(fp32_output, x.detach())
+            else:
+                # 1. dequantize weights (int8 -> fp32)
+                dequant_weight = self.quantizer.forward(self.quant_weight)
+
+                # 2. fake quantization in fp32
+                x = self.fwd_func(x, dequant_weight, self.bias, **self.fwd_kwargs)
+
+                # 3. Output fake quantization
+                x = self.output_quantizer.forward(x)
+
             return x
-        
+
         else:  # fp32
-            return self.fwd_func(x, self.weight, self.bias, **self.fwd_kwargs)  
-            
+            if self.enable_profiling and self.profiler is not None:
+                # FP32 mode - measure time without quantization
+                with self.profiler.measure_time():
+                    pass  # No quantization, just time measurement
+
+            return self.fwd_func(x, self.weight, self.bias, **self.fwd_kwargs)
 
 
-def test_quant_linear(observer_type='PercentileObserver'):
-    # ========== 1. Config 설정 ==========
-    bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    quant_config = QuantConfig(
-        calibration_mode='layer_wise',
-        bit_type=bit_config,
-        observer_type=observer_type
+def test_quantlinear_profiling():
+    """
+    Test QuantLinear profiling functionality.
+
+    Tests:
+    1. Forward pass automatically updates profiler
+    2. get_profiling_results() returns correct data for both weight and output
+    3. Statistics, histogram, and timing info are collected
+    """
+    print("="*80)
+    print("QuantLinear Profiling Test")
+    print("="*80)
+
+    # Create test Linear module
+    print("\n[1] Creating Linear module")
+    in_features = 768
+    out_features = 3072  # MLP expansion
+    original_linear = nn.Linear(in_features, out_features)
+    print(f"  ✓ Original Linear created ({in_features} -> {out_features})")
+
+    # Create test config
+    config = QuantConfig(
+        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
+        observer_type='PercentileObserver',
+        calibration_mode='channel_wise'
     )
 
-    # ========== 2. 간단한 MLP 모델 생성 ==========
-    class SimpleMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(784, 784)
-            self.fc2 = nn.Linear(784, 784)
-            self.fc3 = nn.Linear(784, 784)
-            self.fc4 = nn.Linear(784, 784)
-            
-        def forward(self, x):
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
-            x = F.relu(self.fc3(x))
-            x = F.relu(self.fc4(x))
-            return x
-    
-    mlp = SimpleMLP()
-    print(f"\n{'='*60}")
-    print(f"Testing with {observer_type}")
-    print(f"{'='*60}")
-    print("Original MLP:")
-    for name, module in mlp.named_modules():
-        if isinstance(module, nn.Linear):
-            print(f"  {name}: {module}")
-
-    # ========== 3. QuantLinear로 변환 ==========
-    quant_layers = []
-    for name, layer in mlp.named_modules():
-        if isinstance(layer, nn.Linear):
-            quant_layer = QuantLinear(
-                input_module=layer,
-                quant_config=quant_config
-            )
-            quant_layers.append(quant_layer)
-            print(f"Converted: {name}")
-
-    print(f"\nQuantLinear 개수: {len(quant_layers)}")
-
-    # ========== 4. 더미 Calibration 데이터 생성 ==========
-    num_batches = 64
-    batch_size = 32
-    input_dim = 784  # 28x28 flattened
-
-    print(f"\n더미 데이터 생성: {num_batches} batches × {batch_size} samples × {input_dim} features")
-    calib_data = [
-        torch.randn(batch_size, input_dim) 
-        for _ in range(num_batches)
-    ]
-
-    # ========== 5. Calibration 수행 ==========
-    print("\n=== Calibration 시작 ===")
-    for batch_idx, x in enumerate(calib_data):
-        out = x
-        for layer_idx, layer in enumerate(quant_layers):
-            out = layer.calibration(out)
-            # ReLU activation (마지막 레이어 제외)
-            if layer_idx < len(quant_layers) - 1:
-                out = F.relu(out)
-        
-        if (batch_idx + 1) % 10 == 0:
-            print(f"Batch {batch_idx + 1}/{num_batches} 완료")
-
-    print("\n=== Calibration 완료 ===")
-
-    # ========== 6. Observer 통계 확인 ==========
-    print("\n=== Observer 통계 ===")
-    for i, layer in enumerate(quant_layers):
-        print(f"\nLayer {i} (fc{i+1}):")
-        print(f"  Observer type: {type(layer.observer).__name__}")
-        print(f"  Weight min_val: {layer.observer.min_val:.6f}")
-        print(f"  Weight max_val: {layer.observer.max_val:.6f}")
-        print(f"  Output min_val: {layer.output_observer.min_val:.6f}")
-        print(f"  Output max_val: {layer.output_observer.max_val:.6f}")
-        print(f"  Weight shape: {layer.weight.shape}")
-        print(f"  Weight range: [{layer.weight.min().item():.4f}, {layer.weight.max().item():.4f}]")
-
-    # ========== 7. Quantization Params 계산 ==========
-    print("\n=== Quantization Parameters 계산 ===")
-    for i, layer in enumerate(quant_layers):
-        (w_scale, w_zero), (out_scale, out_zero) = layer.compute_quant_params()
-        print(f"\nLayer {i} (fc{i+1}):")
-        print(f"  Weight - scale: {w_scale:.8f}, zero: {w_zero:.2f}")
-        print(f"  Output - scale: {out_scale:.8f}, zero: {out_zero:.2f}")
-
-    # ========== 8. FP32 vs Fake Quantization 비교 ==========
-    print("\n=== FP32 vs Fake Quantization 출력 비교 ===")
-    test_input = torch.randn(1, input_dim)
-    
-    # FP32 forward
-    out_fp32 = test_input
-    for layer in quant_layers:
-        layer.mode = 'fp32'
-        out_fp32 = layer(out_fp32)
-        if layer != quant_layers[-1]:
-            out_fp32 = F.relu(out_fp32)
-    
-    # Fake Quantization forward
-    out_quant = test_input
-    for layer in quant_layers:
-        layer.mode = 'quantized'
-        out_quant = layer(out_quant)
-        if layer != quant_layers[-1]:
-            out_quant = F.relu(out_quant)
-    
-    print(f"FP32 output: {out_fp32[0, :5]}")  # 처음 5개만
-    print(f"Fake Quant output: {out_quant[0, :5]}")
-    print(f"MSE: {F.mse_loss(out_fp32, out_quant).item():.6f}")
-    print(f"Max diff: {(out_fp32 - out_quant).abs().max().item():.6f}")
-
-    print(f"\n=== {observer_type} 테스트 완료 ===\n")
-
-
-def test_with_profiler():
-    """Profiler 테스트 - 레이어별 출력 QSNR 측정"""
-    from .layer_profiler import StatProfiler, TimeProfiler, HistProfiler
-
-    print("="*60)
-    print("Testing QuantLinear with Profilers (Layer-wise Output QSNR)")
-    print("="*60)
-
-    # 1. Config 설정
-    bit_config = BitTypeConfig(bits=8, signed=True, name='int8')
-    quant_config = QuantConfig(
-        calibration_mode='layer_wise',
-        bit_type=bit_config,
-        observer_type='PercentileObserver'
+    # Create QuantLinear with profiling enabled
+    print("\n[2] Creating QuantLinear with profiling enabled")
+    layer = QuantLinear(
+        input_module=original_linear,
+        quant_config=config,
+        layer_name='test_qlinear',
+        enable_profiling=True
     )
+    print("  ✓ QuantLinear created")
+    print(f"  Layer name: {layer.layer_name}")
+    print(f"  Profiling enabled: {layer.enable_profiling}")
+    print(f"  Output profiler: {layer.profiler is not None}")
+    print(f"  Weight profiler: {layer.weight_profiler is not None}")
+    print(f"  Weight shape: {layer.weight.shape}")
 
-    # 2. SimpleMLP 생성 및 QuantLinear 변환
-    class SimpleMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(784, 512)
-            self.fc2 = nn.Linear(512, 256)
-            self.fc3 = nn.Linear(256, 128)
-            self.fc4 = nn.Linear(128, 10)
+    # Generate test data
+    print("\n[3] Generating calibration data")
+    batch_size = 8
+    seq_len = 197
+    num_calib_batches = 10
 
-    mlp = SimpleMLP()
+    calib_data = [torch.randn(batch_size, seq_len, in_features) for _ in range(num_calib_batches)]
+    print(f"  Calibration batches: {num_calib_batches}")
+    print(f"  Batch shape: {calib_data[0].shape}")
 
-    # QuantLinear로 변환
-    quant_layers = {}
-    for name, layer in mlp.named_modules():
-        if isinstance(layer, nn.Linear):
-            quant_layers[name] = QuantLinear(
-                input_module=layer,
-                quant_config=quant_config
-            )
+    # Calibration
+    print("\n[4] Running calibration")
+    layer.eval()
+    with torch.no_grad():
+        for idx, x in enumerate(calib_data):
+            _ = layer.calibration(x)
+            if (idx + 1) % 5 == 0:
+                print(f"  Batch {idx + 1}/{num_calib_batches} completed")
+    print("  ✓ Calibration completed")
 
-    print(f"Converted {len(quant_layers)} layers: {list(quant_layers.keys())}")
+    # Compute quantization parameters
+    print("\n[5] Computing quantization parameters")
+    (weight_scaler, weight_zero), (output_scaler, output_zero) = layer.compute_quant_params()
+    print(f"  Weight scale shape: {weight_scaler.shape if isinstance(weight_scaler, torch.Tensor) else 'scalar'}")
+    print(f"  Weight scale (first 5): {weight_scaler[:5] if isinstance(weight_scaler, torch.Tensor) and weight_scaler.numel() > 5 else weight_scaler}")
+    print(f"  Output scale shape: {output_scaler.shape if isinstance(output_scaler, torch.Tensor) else 'scalar'}")
+    print(f"  Quantized weight shape: {layer.quant_weight.shape}")
+    print("  ✓ Quantization parameters computed")
 
-    # 3. 더미 데이터
-    num_batches = 16
-    batch_size = 32
-    calib_data = [torch.randn(batch_size, 784) for _ in range(num_batches)]
+    # Check if weight profiler was updated
+    print("\n[5.1] Checking weight profiler after compute_quant_params")
+    if layer.weight_profiler is not None:
+        has_weight = layer.weight_profiler.weight is not None
+        has_quant_weight = layer.weight_profiler.quant_weight is not None
+        print(f"  Weight profiler has weight: {has_weight}")
+        print(f"  Weight profiler has quant_weight: {has_quant_weight}")
+        if has_weight:
+            weight_results = layer.get_profiling_results()
+            if weight_results and 'weight' in weight_results:
+                w_stats = weight_results['weight']['statistics']
+                if w_stats:
+                    print(f"  Weight QSNR: {w_stats.get('qsnr', 'N/A'):.2f} dB")
+                    print(f"  Weight MSE: {w_stats.get('mse', 'N/A'):.10f}")
+    else:
+        print("  ✗ Weight profiler is None")
 
-    # 4. Calibration
-    print("\n=== Calibration ===")
-    for x in calib_data:
-        out = x
-        for name in ['fc1', 'fc2', 'fc3', 'fc4']:
-            out = quant_layers[name].calibration(out)
-            if name != 'fc4':
-                out = F.relu(out)
+    # Save weight profiling results before reset
+    print("\n[5.2] Saving weight profiling results")
+    weight_profiling_results = layer.get_profiling_results()
+    print("  ✓ Weight profiling results saved")
 
-    # Quantization params 계산
-    for name, layer in quant_layers.items():
-        layer.compute_quant_params()
-    print("Calibration 완료")
+    # Test data
+    test_input = torch.randn(1, seq_len, in_features)
 
-    # 5. 레이어별 출력 QSNR 측정
-    print("\n=== 레이어별 출력 QSNR (Output Quality) ===")
-    test_input = torch.randn(1, 784)
+    # FP32 inference
+    print("\n[6] Testing FP32 mode (no quantization)")
+    layer.mode = 'fp32'
+    # Don't reset profiling here - keep weight data
+    # Only reset output profiler
+    if layer.profiler is not None:
+        layer.profiler.reset_time_profiler()
+        layer.profiler.reset_memory_profiler()
+        layer.profiler.weight = None
+        layer.profiler.quant_weight = None
 
-    layer_stats = {}
-    x_fp32 = test_input
-    x_quant = test_input
+    with torch.no_grad():
+        for _ in range(50):
+            _ = layer(test_input)
 
-    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
-        layer = quant_layers[name]
+    results_fp32 = layer.get_profiling_results()
+    print("  ✓ FP32 forward completed (50 iterations)")
 
-        # FP32 forward
-        layer.mode = 'fp32'
-        out_fp32 = layer(x_fp32)
+    if results_fp32 and 'output' in results_fp32 and results_fp32['output']['time']:
+        time_data = results_fp32['output']['time']
+        if 'test_qlinear_output' in time_data:
+            stats = time_data['test_qlinear_output']
+            print(f"  Timing - Count: {stats['count']}, Mean: {stats['mean']*1000:.4f} ms")
+        else:
+            print("  Warning: No timing data for 'test_qlinear_output'")
+    else:
+        print("  Warning: No timing results in FP32 mode")
 
-        # Quantized forward
-        layer.mode = 'quantized'
-        out_quant = layer(x_quant)
+    # Quantized inference
+    print("\n[7] Testing Quantized mode (with profiling)")
+    layer.mode = 'quantized'
+    layer.reset_profiling()
 
-        # 출력 비교 (이게 진짜 중요!)
-        stats = StatProfiler.compute(out_fp32, out_quant)
-        layer_stats[name] = stats
+    print("  Running 100 iterations...")
+    with torch.no_grad():
+        for _ in range(100):
+            output_quant = layer(test_input)
 
-        print(f"\n{name} Output:")
-        print(f"  MSE: {stats['mse']:.6f}")
-        print(f"  Cosine Sim: {stats['cosine_sim']:.4f}")
-        print(f"  QSNR: {stats['qsnr']:.2f} dB")  # 출력이니까 QSNR이 의미있음
+    print("  ✓ Quantized forward completed (100 iterations)")
+    print(f"  Output shape: {output_quant.shape}")
+    print(f"  Output range: [{output_quant.min():.6f}, {output_quant.max():.6f}]")
 
-        # 다음 레이어 입력 준비 (ReLU 적용)
-        if name != 'fc4':
-            x_fp32 = F.relu(out_fp32)
-            x_quant = F.relu(out_quant)
+    # Get profiling results
+    print("\n[8] Retrieving profiling results")
+    results = layer.get_profiling_results()
 
-    # 6. 최종 출력 비교
-    print("\n=== 전체 모델 출력 비교 ===")
+    if results is None:
+        print("  ✗ ERROR: get_profiling_results() returned None!")
+        return
 
-    # 전체 FP32
-    out = test_input
-    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
-        quant_layers[name].mode = 'fp32'
-        out = quant_layers[name](out)
-        if name != 'fc4':
-            out = F.relu(out)
-    final_fp32 = out
+    print("  ✓ Profiling results retrieved")
+    print(f"  Result keys: {list(results.keys())}")
 
-    # 전체 Quantized
-    out = test_input
-    for name in ['fc1', 'fc2', 'fc3', 'fc4']:
-        quant_layers[name].mode = 'quantized'
-        out = quant_layers[name](out)
-        if name != 'fc4':
-            out = F.relu(out)
-    final_quant = out
+    # Check weight statistics (from saved results after compute_quant_params)
+    print("\n[9] Weight Statistics (from compute_quant_params)")
+    weight_qsnr_pass = False
+    if weight_profiling_results and 'weight' in weight_profiling_results and weight_profiling_results['weight']['statistics'] is not None:
+        stats = weight_profiling_results['weight']['statistics']
+        print("  ✓ Weight statistics available")
+        qsnr = stats.get('qsnr', 'N/A')
+        mse = stats.get('mse', 'N/A')
 
-    final_stats = StatProfiler.compute(final_fp32, final_quant)
-    print(f"Final MSE: {final_stats['mse']:.6f}")
-    print(f"Final Cosine Sim: {final_stats['cosine_sim']:.4f}")
-    print(f"Final QSNR: {final_stats['qsnr']:.2f} dB")
+        print(f"    QSNR: {qsnr:.2f} dB" if isinstance(qsnr, (int, float)) else f"    QSNR: {qsnr}")
+        print(f"    MSE: {mse:.10f}" if isinstance(mse, (int, float)) else f"    MSE: {mse}")
 
-    print("\n=== 모든 Profiler 테스트 완료 ===")
+        # Quality check
+        if isinstance(qsnr, (int, float)):
+            if qsnr >= 30:
+                print("    ✓ Quality: EXCELLENT (QSNR >= 30 dB)")
+                weight_qsnr_pass = True
+            elif qsnr >= 20:
+                print("    ⚠ Quality: GOOD (QSNR >= 20 dB)")
+                weight_qsnr_pass = True
+            elif qsnr >= 10:
+                print("    ⚠ Quality: ACCEPTABLE (QSNR >= 10 dB)")
+                weight_qsnr_pass = True
+            else:
+                print("    ✗ Quality: POOR (QSNR < 10 dB) - Quantization may be incorrect!")
+    else:
+        print("  ✗ Weight statistics: None")
+
+    # Check weight histogram (from saved results after compute_quant_params)
+    print("\n[10] Weight Histogram (from compute_quant_params)")
+    if weight_profiling_results and 'weight' in weight_profiling_results and weight_profiling_results['weight']['histogram'] is not None:
+        hist = weight_profiling_results['weight']['histogram']
+        print("  ✓ Weight histogram available")
+        if 'kl_divergence' in hist:
+            print(f"    KL Divergence: {hist['kl_divergence']:.6f}")
+    else:
+        print("  ✗ Weight histogram: None")
+
+    # Check output statistics
+    print("\n[11] Output Statistics")
+    if 'output' in results and results['output']['statistics'] is not None:
+        stats = results['output']['statistics']
+        print("  ✓ Output statistics available")
+        qsnr = stats.get('qsnr', 'N/A')
+        mse = stats.get('mse', 'N/A')
+
+        print(f"    QSNR: {qsnr:.2f} dB" if isinstance(qsnr, (int, float)) else f"    QSNR: {qsnr}")
+        print(f"    MSE: {mse:.10f}" if isinstance(mse, (int, float)) else f"    MSE: {mse}")
+    else:
+        print("  ✗ Output statistics: None")
+
+    # Check output histogram
+    print("\n[12] Output Histogram")
+    if 'output' in results and results['output']['histogram'] is not None:
+        hist = results['output']['histogram']
+        print("  ✓ Output histogram available")
+        if 'kl_divergence' in hist:
+            print(f"    KL Divergence: {hist['kl_divergence']:.6f}")
+    else:
+        print("  ✗ Output histogram: None")
+
+    # Check timing
+    print("\n[13] Timing Information")
+    if 'output' in results:
+        time_data = results['output']['time']
+        if time_data and 'test_qlinear_output' in time_data:
+            time_stats = time_data['test_qlinear_output']
+            print("  ✓ Timing data available")
+            print(f"    Count: {time_stats['count']}")
+            print(f"    Mean: {time_stats['mean']*1000:.4f} ms")
+            print(f"    Min: {time_stats['min']*1000:.4f} ms")
+            print(f"    Max: {time_stats['max']*1000:.4f} ms")
+            print(f"    Total: {time_stats['total']*1000:.4f} ms")
+        else:
+            print("  ✗ Timing: No data for 'test_qlinear_output'")
+
+    # Check memory
+    print("\n[14] Memory Information")
+    if 'output' in results:
+        mem_data = results['output']['memory']
+        if mem_data:
+            print(f"  Memory profiler data: {mem_data}")
+        else:
+            print("  Memory: No data (expected if not attached)")
+
+    # Verify profiler objects
+    print("\n[15] Verifying profiler objects")
+    prof_dict = layer.get_profiler()
+    if prof_dict is not None:
+        print("  ✓ get_profiler() returns profiler dictionary")
+        print(f"    Output profiler name: {prof_dict['output'].name}")
+        print(f"    Weight profiler name: {prof_dict['weight'].name}")
+        print(f"    Output has data: {prof_dict['output'].weight is not None}")
+        print(f"    Weight has data: {prof_dict['weight'].weight is not None}")
+    else:
+        print("  ✗ get_profiler() returned None")
+
+    # Test reset
+    print("\n[16] Testing reset_profiling()")
+    layer.reset_profiling()
+    print("  ✓ reset_profiling() called")
+
+    # Verify reset
+    prof_dict_after = layer.get_profiler()
+    if prof_dict_after is not None:
+        print(f"    Output weight after reset: {prof_dict_after['output'].weight}")
+        print(f"    Weight weight after reset: {prof_dict_after['weight'].weight}")
+
+    # Summary
+    print("\n" + "="*80)
+    print("Test Summary")
+    print("="*80)
+
+    passed_tests = []
+    failed_tests = []
+
+    # Check critical functionality
+    if layer.profiler is not None and layer.weight_profiler is not None:
+        passed_tests.append("Profiler initialization (output + weight)")
+    else:
+        failed_tests.append("Profiler initialization")
+
+    if results is not None:
+        passed_tests.append("get_profiling_results() returns data")
+    else:
+        failed_tests.append("get_profiling_results() returns data")
+
+    if weight_profiling_results and 'weight' in weight_profiling_results and weight_profiling_results['weight']['statistics'] is not None:
+        passed_tests.append("Weight statistics collection")
+        if weight_qsnr_pass:
+            passed_tests.append("Weight quantization quality (QSNR >= 10 dB)")
+        else:
+            failed_tests.append("Weight quantization quality (QSNR < 10 dB)")
+    else:
+        failed_tests.append("Weight statistics collection")
+
+    if results and 'output' in results and results['output']['statistics'] is not None:
+        passed_tests.append("Output statistics collection")
+    else:
+        failed_tests.append("Output statistics collection")
+
+    if weight_profiling_results and 'weight' in weight_profiling_results and weight_profiling_results['weight']['histogram'] is not None:
+        passed_tests.append("Weight histogram generation")
+    else:
+        failed_tests.append("Weight histogram generation")
+
+    if results and 'output' in results and results['output']['histogram'] is not None:
+        passed_tests.append("Output histogram generation")
+    else:
+        failed_tests.append("Output histogram generation")
+
+    if results and 'output' in results and results['output']['time'] and 'test_qlinear_output' in results['output']['time']:
+        passed_tests.append("Timing profiling")
+    else:
+        failed_tests.append("Timing profiling")
+
+    print(f"\n✓ Passed: {len(passed_tests)}")
+    for test in passed_tests:
+        print(f"  - {test}")
+
+    if failed_tests:
+        print(f"\n✗ Failed: {len(failed_tests)}")
+        for test in failed_tests:
+            print(f"  - {test}")
+
+    print("\n" + "="*80)
+    if len(failed_tests) == 0:
+        print("ALL TESTS PASSED!")
+    else:
+        print(f"SOME TESTS FAILED ({len(failed_tests)}/{len(passed_tests) + len(failed_tests)})")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    # 기본 테스트
-    observer_types = ['MinmaxObserver', 'PercentileObserver']
+    import sys
+    from pathlib import Path
+    # Add project root to path
+    project_root = Path(__file__).parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-    print("="*60)
-    print("Testing QuantLinear")
-    print("="*60)
-
-    for observer_type in observer_types:
-        try:
-            test_quant_linear(observer_type=observer_type)
-        except Exception as e:
-            print(f"\n{observer_type} 테스트 실패")
-            print(f"Error: {e}\n")
-
-    # Profiler 테스트
-    try:
-        test_with_profiler()
-    except Exception as e:
-        print(f"\nProfiler 테스트 실패: {e}")
-
-    print("="*60)
-    print("모든 테스트 완료")
-    print("="*60)
+    test_quantlinear_profiling()
