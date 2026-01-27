@@ -11,14 +11,18 @@ class PercentileObserver(BaseObserver):
                  module_type,
                  calibration_mode,
                  percentile_sigma=0.01,
-                 percentile_alpha=0.99999):
+                 percentile_alpha=0.99999,
+                 num_heads=None,
+                 head_dim=None):
         super(PercentileObserver, self).__init__(bit_type=bit_type,
                                                   module_type=module_type,
-                                                  calibration_mode=calibration_mode)
+                                                  calibration_mode=calibration_mode,
+                                                  num_heads=num_heads,
+                                                  head_dim=head_dim)
         self.percentile_sigma = percentile_sigma
         self.percentile_alpha = percentile_alpha
         self.bit_type = bit_type
-        self.symmetric = self.bit_type.signed
+        self.symmetric = self.bit_type.symmetric
         self.max_val = None
         self.min_val = None
         self.device = None
@@ -38,15 +42,20 @@ class PercentileObserver(BaseObserver):
         v = self.reshape_tensor(v)
 
         if self.calibration_mode == 'channel_wise':
-            cur_max = torch.quantile(v, self.percentile_alpha, dim = 1)
-            cur_min = torch.quantile(v, 1.0 - self.percentile_alpha, dim = 1)
+            cur_max = torch.quantile(v, self.percentile_alpha, dim=1)
+            cur_min = torch.quantile(v, 1.0 - self.percentile_alpha, dim=1)
+        elif self.calibration_mode == 'head_wise':
+            # head_wise: reshape_tensor에서 이미 (num_heads, ...) 형태
+            # channel_wise와 동일하게 처리
+            cur_max = torch.quantile(v, self.percentile_alpha, dim=1)
+            cur_min = torch.quantile(v, 1.0 - self.percentile_alpha, dim=1)
         elif self.calibration_mode == 'layer_wise':
             cur_max = torch.quantile(v.reshape(-1), self.percentile_alpha)
             cur_min = torch.quantile(v.reshape(-1), 1.0 - self.percentile_alpha)
         else:
             raise ValueError(
                 f"Invalid calibration_mode: '{self.calibration_mode}'. "
-                f"Expected 'channel_wise' or 'layer_wise'."
+                f"Expected 'channel_wise', 'head_wise', or 'layer_wise'."
             )
 
         if self.max_val is None:
@@ -106,7 +115,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'conv_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),  # symmetric
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -116,7 +125,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'conv_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=False, name='uint8'),  # asymmetric
+            'bit_type': BitType(bits=8, symmetric=False, name='uint8'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -126,7 +135,7 @@ def main():
             'input_shape': (4, 64),
             'module_type': 'linear_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -136,7 +145,7 @@ def main():
             'input_shape': (4, 64),
             'module_type': 'linear_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=False, name='uint8'),
+            'bit_type': BitType(bits=8, symmetric=False, name='uint8'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -149,7 +158,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'activation',
             'use_weight': False,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -162,7 +171,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'activation',
             'use_weight': False,
-            'bit_type': BitType(bits=8, signed=False, name='uint8'),
+            'bit_type': BitType(bits=8, symmetric=False, name='uint8'),
             'percentile_sigma': 0.1,
             'percentile_alpha': 0.99
         },
@@ -190,9 +199,9 @@ def main():
                 percentile_alpha=test_case['percentile_alpha']
             )
             
-            is_symmetric = test_case['bit_type'].signed
+            is_symmetric = test_case['bit_type'].symmetric
             print(f"Quantization Mode: {'SYMMETRIC' if is_symmetric else 'ASYMMETRIC'}")
-            print(f"BitType: {test_case['bit_type'].name} (bits={test_case['bit_type'].bits}, signed={test_case['bit_type'].signed})")
+            print(f"BitType: {test_case['bit_type'].name} (bits={test_case['bit_type'].bits}, symmetric={test_case['bit_type'].symmetric})")
             print(f"Range: [{test_case['bit_type'].lower_bound}, {test_case['bit_type'].upper_bound}]")
             print()
             

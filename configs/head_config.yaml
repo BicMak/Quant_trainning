@@ -1,0 +1,50 @@
+# ViT Head Configuration
+# Final LayerNorm and Classifier Head quantization settings
+
+# ==================== Final LayerNorm ====================
+# LayerNorm before classification head
+# - 입력: 마지막 Block 출력
+# - 출력: Head Linear 입력
+final_norm:
+  calibration_mode: layer_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# ==================== Classification Head ====================
+# Final Linear layer for classification
+# - 입력: CLS token [B, 768]
+# - 출력: Class logits [B, num_classes]
+head:
+  weight:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      symmetric: True
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.1
+    kl_bins: 2048
+    enable_profiler: True
+  output:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      symmetric: False
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9999
+    percentile_sigma: 0.1
+    kl_bins: 2048
+    enable_profiler: True
+    output_quant_enable: True

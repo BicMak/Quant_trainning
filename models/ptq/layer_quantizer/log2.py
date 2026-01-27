@@ -12,10 +12,12 @@ class Log2Quantizer(BaseQuantizer):
     Used after softmax where outputs are in (0, 1] range.
     """
 
-    def __init__(self, bit_type, module_type):
+    def __init__(self, bit_type, module_type, num_heads=None, head_dim=None):
         super(Log2Quantizer, self).__init__(
             bit_type=bit_type,
             module_type=module_type,
+            num_heads=num_heads,
+            head_dim=head_dim,
         )
         self.softmax_mask = None
 

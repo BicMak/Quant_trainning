@@ -5,10 +5,12 @@ import torch.nn as nn
 
 class BaseQuantizer(nn.Module):
 
-    def __init__(self, bit_type, module_type):
+    def __init__(self, bit_type, module_type, num_heads=None, head_dim=None):
         super(BaseQuantizer, self).__init__()
         self.bit_type = bit_type
         self.module_type = module_type
+        self.num_heads = num_heads
+        self.head_dim = head_dim
 
     def get_reshape_range(self, inputs):
         range_shape = None

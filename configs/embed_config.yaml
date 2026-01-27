@@ -1,0 +1,70 @@
+# Embedding Quantization Configuration
+# For Patch Embedding layer quantization
+# Uses MinmaxObserver instead of PercentileObserver
+
+# ==================== Embedding Configuration ====================
+outputs:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9995
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+  output_quant_enable: False
+
+weight:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: true
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.01
+  kl_bins: 2048
+  enable_profiler: True
+
+activation:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9995
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+norm:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9995
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+intsoft:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9995
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True

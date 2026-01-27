@@ -5,9 +5,16 @@ import torch.nn as nn
 
 
 class BitType:
-    def __init__(self, bits, signed, name=None):
+    def __init__(self, bits, symmetric, name=None):
+        """
+        Args:
+            bits: Number of bits for quantization
+            symmetric: True for symmetric quantization (zero_point=0),
+                      False for asymmetric quantization
+            name: Optional name for the bit type
+        """
         self.bits = bits
-        self.signed = signed
+        self.symmetric = symmetric
         if name is not None:
             self.name = name
         else:
@@ -15,13 +22,13 @@ class BitType:
 
     @property
     def upper_bound(self):
-        if not self.signed:
+        if not self.symmetric:
             return 2**self.bits - 1
         return 2**(self.bits - 1) - 1
 
     @property
     def lower_bound(self):
-        if not self.signed:
+        if not self.symmetric:
             return 0
         return -(2**(self.bits - 1))
 
@@ -31,7 +38,7 @@ class BitType:
 
     def update_name(self):
         self.name = ''
-        if not self.signed:
+        if not self.symmetric:
             self.name += 'uint'
         else:
             self.name += 'int'
@@ -43,6 +50,6 @@ BIT_TYPE_LIST = [
     BitType(8, True, 'int8'),
     BitType(8, False, 'uint8'),
     BitType(16, True, 'int16'),
-    BitType(16, False, 'uint16'),    
+    BitType(16, False, 'uint16'),
 ]
 BIT_TYPE_DICT = {bit_type.name: bit_type for bit_type in BIT_TYPE_LIST}

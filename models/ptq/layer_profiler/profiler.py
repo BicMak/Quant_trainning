@@ -6,17 +6,34 @@ from .MemoryProfiler import MemoryProfiler
 
 class profiler:
     def __init__(self, name):
-        self.weight = None
-        self.quant_weight = None
         self.stat_data = None
         self.hist_data = None
         self.time_profiler = TimeProfiler()
         self.memory_profiler = MemoryProfiler()
         self.name = name
 
+        # Batch-wise storage for activation profiling
+        self.weight_batch_list = []  # List of weight tensors (each can be batched)
+        self.quant_batch_list = []   # List of quantized tensors (each can be batched)
+
     def update_weight(self, weight, quant_weight):
-        self.weight = weight
-        self.quant_weight = quant_weight
+        """
+        Update weight/activation tensors.
+
+        Args:
+            weight: Original tensor, can be:
+                    - Single tensor (weight profiling)
+                    - Batched tensor [B, ...] (activation profiling)
+            quant_weight: Quantized tensor (same shape as weight)
+
+        Behavior:
+            - Stores each tensor in batch list
+            - When get_statistic() is called, all batches are concatenated
+        """
+        # Store the batch tensors (will be concatenated later)
+        self.weight_batch_list.append(weight.detach().cpu() if hasattr(weight, 'detach') else weight)
+        self.quant_batch_list.append(quant_weight.detach().cpu() if hasattr(quant_weight, 'detach') else quant_weight)
+
 
     @staticmethod
     def _check_null(weight, quantweight):
@@ -26,15 +43,53 @@ class profiler:
             return True
 
     def get_statistic(self):
-        """Get statistical analysis of weight and quantized weight"""
-        profiler._check_null(self.weight, self.quant_weight)
-        self.stat_data = StatProfiler.compute(self.weight, self.quant_weight)
+        """
+        Get statistical analysis of weight and quantized weight.
+
+        Behavior:
+            - If batches have been accumulated via update_weight():
+              Concatenates all batches along dim=0 and computes statistics on full dataset
+            - Otherwise: Returns None
+
+        Returns:
+            dict: Statistics (QSNR, MSE, min, max, mean, std, etc.)
+                  Computed on all accumulated data
+        """
+        if len(self.weight_batch_list) > 0 and len(self.quant_batch_list) > 0:
+            # Concatenate all batches into single tensor
+            # Each batch: [B, ...], after cat: [total_samples, ...]
+            weight_cat = torch.cat(self.weight_batch_list, dim=0)
+            quant_cat = torch.cat(self.quant_batch_list, dim=0)
+
+            # Compute statistics on full dataset
+            self.stat_data = StatProfiler.compute(weight_cat, quant_cat)
+        else:
+            # No data accumulated
+            return None
+
         return self.stat_data
 
     def get_hist(self):
-        """Get histogram data of weight and quantized weight"""
-        profiler._check_null(self.weight, self.quant_weight)
-        self.hist_data = HistProfiler.compute(self.weight, self.quant_weight)
+        """
+        Get histogram data of weight and quantized weight.
+
+        Behavior:
+            - Concatenates all accumulated batches and computes histogram on full dataset
+
+        Returns:
+            dict: Histogram data
+        """
+        if len(self.weight_batch_list) > 0 and len(self.quant_batch_list) > 0:
+            # Concatenate all batches into single tensor
+            weight_cat = torch.cat(self.weight_batch_list, dim=0)
+            quant_cat = torch.cat(self.quant_batch_list, dim=0)
+
+            # Compute histogram on full dataset
+            self.hist_data = HistProfiler.compute(weight_cat, quant_cat)
+        else:
+            # No data accumulated
+            return None
+
         return self.hist_data
 
     def measure_time(self, func=None, *args, **kwargs):
@@ -73,5 +128,14 @@ class profiler:
     def reset_memory_profiler(self):
         """Reset memory profiler records"""
         self.memory_profiler = MemoryProfiler()
+
+    def clear_batches(self):
+        """Clear accumulated batch data"""
+        self.weight_batch_list = []
+        self.quant_batch_list = []
+
+    def get_batch_count(self):
+        """Get number of accumulated batches"""
+        return len(self.weight_batch_list)
 
 

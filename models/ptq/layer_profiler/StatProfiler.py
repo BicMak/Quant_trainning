@@ -5,11 +5,22 @@ class StatProfiler:
     @staticmethod
     def compute(original: torch.Tensor, quantized: torch.Tensor) -> dict:
         return {
+            # Quantized statistics
             'min': quantized.min().item(),
             'max': quantized.max().item(),
             'mean': quantized.mean().item(),
             'std': quantized.std().item(),
-            'outlier_ratio': StatProfiler._outlier_ratio(original),
+            'outlier_ratio': StatProfiler._outlier_ratio(quantized),
+
+
+            # Original (FP32) statistics
+            'original_min': original.min().item(),
+            'original_max': original.max().item(),
+            'original_mean': original.mean().item(),
+            'original_std': original.std().item(),
+            'original_outlier_ratio': StatProfiler._outlier_ratio(original),
+
+            # Comparison metrics
             'mse': F.mse_loss(original, quantized).item(),
             'cosine_sim': F.cosine_similarity(
                 original.flatten().unsqueeze(0),

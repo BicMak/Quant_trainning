@@ -13,10 +13,12 @@ class UniformQuantizer(BaseQuantizer):
                 x' = (q - zero_point) * scale
     """
 
-    def __init__(self, bit_type, module_type):
+    def __init__(self, bit_type, module_type, num_heads=None, head_dim=None):
         super(UniformQuantizer, self).__init__(
             bit_type=bit_type,
             module_type=module_type,
+            num_heads=num_heads,
+            head_dim=head_dim,
         )
         self.scale = None
         self.zero_point = None
@@ -25,8 +27,6 @@ class UniformQuantizer(BaseQuantizer):
         self.scale, self.zero_point = scale, zero_point
 
     def quant(self, inputs, scale=None, zero_point=None):
-        
-        #check the None of parameter
         if scale is None:
             scale = self.scale
         if zero_point is None:
@@ -34,15 +34,15 @@ class UniformQuantizer(BaseQuantizer):
 
         scale = scale.to(inputs.device)
         zero_point = zero_point.to(inputs.device)
-        
 
+        # Standard quantization
         range_shape = self.get_reshape_range(inputs)
         scale = scale.reshape(range_shape)
         zero_point = zero_point.reshape(range_shape)
         outputs = inputs / scale + zero_point
         outputs = outputs.round().clamp(self.bit_type.lower_bound,
                                         self.bit_type.upper_bound)
-        
+
         return outputs
 
     def dequantize(self, inputs, scale=None, zero_point=None):
@@ -50,10 +50,11 @@ class UniformQuantizer(BaseQuantizer):
             scale = self.scale
         if zero_point is None:
             zero_point = self.zero_point
-        
+
         scale = scale.to(inputs.device)
         zero_point = zero_point.to(inputs.device)
-                    
+
+        # Standard dequantization
         range_shape = self.get_reshape_range(inputs)
         scale = scale.reshape(range_shape)
         zero_point = zero_point.reshape(range_shape)

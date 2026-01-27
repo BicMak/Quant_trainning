@@ -1,0 +1,74 @@
+# ViT Block Configuration
+# Block-level quantization settings (norm1, norm2, residual)
+# For attention and MLP, use separate config files (attn_config.yaml, mlp_config.yaml)
+
+# ==================== LayerNorm Configurations ====================
+
+# LayerNorm 1 (before Attention)
+# - 입력: 이전 블록 출력 또는 patch embedding
+# - 출력: Attention QKV Linear 입력
+norm1:
+  calibration_mode: layer_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# LayerNorm 2 (before MLP)
+# - 입력: Residual1 출력
+# - 출력: MLP FC1 입력
+norm2:
+  calibration_mode: layer_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# ==================== Residual Quantization (Optional) ====================
+# Residual 양자화는 선택적입니다.
+# 활성화하면 residual connection 후 추가 양자화가 적용됩니다.
+# 비활성화하려면 아래 섹션을 주석 처리하세요.
+
+# Residual 1 (after Attention + skip connection)
+# - 입력: x + drop_path(attn_output)
+# - 출력: norm2 입력
+residual1:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: True
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# Residual 2 (after MLP + skip connection)
+# - 입력: residual1 + drop_path(mlp_output)
+# - 출력: 다음 블록 입력 또는 최종 출력
+residual2:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: True
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True

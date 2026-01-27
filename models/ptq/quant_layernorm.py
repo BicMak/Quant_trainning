@@ -16,19 +16,18 @@ class QLayerNorm(nn.Module):
     def __init__(self,
                  input_module: nn.Module,
                  quant_config: QuantConfig,
-                 layer_name: str = 'qlayernorm',
-                 enable_profiling: bool = False):
+                 layer_name: str = 'qlayernorm'):
         super().__init__()
 
-        # quant_config에서 설정 추출
+        # Config 설정
         self.input_module = input_module
         self.layer_name = layer_name
-        self.enable_profiling = enable_profiling
         self.quant_config = quant_config
+        self.enable_profiling = quant_config.enable_profiler
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
             bits=quant_config.bit_type.bits,
-            signed=quant_config.bit_type.signed,
+            symmetric=quant_config.bit_type.symmetric,
             name=quant_config.bit_type.name
         )
         self.calibration_mode = quant_config.calibration_mode
@@ -178,8 +177,8 @@ class QLayerNorm(nn.Module):
             return None
 
         try:
-            stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
-            hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+            stats = self.profiler.get_statistic() if len(self.profiler.weight_batch_list) > 0 else None
+            hist = self.profiler.get_hist() if len(self.profiler.weight_batch_list) > 0 else None
         except (ValueError, AttributeError):
             # update_weight()가 아직 호출되지 않은 경우
             stats = None
@@ -197,8 +196,7 @@ class QLayerNorm(nn.Module):
         if self.enable_profiling and self.profiler is not None:
             self.profiler.reset_time_profiler()
             self.profiler.reset_memory_profiler()
-            self.profiler.weight = None
-            self.profiler.quant_weight = None
+            self.profiler.clear_batches()
 
 
     @staticmethod
@@ -343,9 +341,10 @@ def test_qlayernorm_profiling():
 
     # Create test config
     config = QuantConfig(
-        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
-        observer_type='minmax',
-        calibration_mode='channel_wise'
+        bit_type=BitTypeConfig(bits=8, symmetric=True, name='int8'),
+        observer_type='MinmaxObserver',
+        calibration_mode='channel_wise',
+        enable_profiler=True
     )
 
     # Create QLayerNorm with profiling enabled
@@ -353,8 +352,7 @@ def test_qlayernorm_profiling():
     layer = QLayerNorm(
         input_module=original_ln,
         quant_config=config,
-        layer_name='test_qlayernorm',
-        enable_profiling=True
+        layer_name='test_qlayernorm'
     )
     print("  ✓ QLayerNorm created")
     print(f"  Layer name: {layer.layer_name}")

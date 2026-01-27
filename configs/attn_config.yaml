@@ -1,17 +1,153 @@
-# Activation Quantization Configuration
-# Activation quantization settings for intermediate outputs
+# Attention Layer Quantization Configuration
+# Per-layer quantization settings for QAttn
+# 구조: QKV Linear 1개 + Q/K/V QAct 3개
 
-# ==================== Global Default Configuration ====================
-default:
+# ==================== Linear Layer Configurations ====================
+
+# QKV Linear Layer (Weight quantization only)
+attn_qkv:
+  weight:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      symmetric: True
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.1
+    kl_bins: 2048
+    enable_profiler: True
+  output:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      symmetric: False
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.999
+    percentile_sigma: 0.2
+    kl_bins: 2048
+    enable_profiler: True
+    output_quant_enable: False
+
+# Projection Linear Layer (Weight quantization only)
+attn_proj:
+  weight:
+    calibration_mode: channel_wise
+    bit_type:
+      bits: 8
+      symmetric: True
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.9995
+    percentile_sigma: 0.1
+    kl_bins: 2048
+    enable_profiler: True
+  output:
+    calibration_mode: layer_wise
+    bit_type:
+      bits: 8
+      symmetric: False
+      name: int8
+    observer_type: MinmaxObserver
+    quantization_method: Uniform
+    percentile_alpha: 0.999
+    percentile_sigma: 0.2
+    kl_bins: 2048
+    enable_profiler: True
+    output_quant_enable: True
+
+# ==================== QKV Activation Quantization ====================
+
+# Q output quantization (after QKV split)
+# head_wise: 12개 head별로 다른 scale 적용 (Per-Head Scaling)
+attn_q_out:
   calibration_mode: channel_wise
   bit_type:
     bits: 8
-    signed: true
+    symmetric: True
     name: int8
-  observer_type: PercnetileObserver
+  observer_type: PercentileObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.99999
+  percentile_sigma: 0.01
+  kl_bins: 2048
+  enable_profiler: True
+
+# K output quantization (after QKV split)
+attn_k_out:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: PercentileObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# V input quantization (after QKV split)
+attn_v_input:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: PercentileObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# ==================== Attention Score Quantization ====================
+
+# Attention score quantization (Q @ K^T output)
+attn_kv_out:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.999
+  percentile_sigma: 0.1
+  kl_bins: 2048
+  enable_profiler: True
+
+# Attention @ V output quantization
+# NOTE: attn @ V 출력은 분포가 넓어서 percentile_alpha를 높게 설정해야 함
+# 0.99 → 0.9999로 변경하여 클리핑 손실 최소화
+attn_v_out:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: True
+    name: int8
+  observer_type: MinmaxObserver
+  quantization_method: Uniform
+  percentile_alpha: 0.9999
+  percentile_sigma: 0.01
+  kl_bins: 2048
+  enable_profiler: True
+
+# ==================== IntSoftmax Configuration ====================
+
+intSoft:
+  calibration_mode: channel_wise
+  bit_type:
+    bits: 8
+    symmetric: False
+    name: int8
+  observer_type: MinmaxObserver
   quantization_method: Uniform
   percentile_alpha: 0.9995
   percentile_sigma: 0.1
   kl_bins: 2048
   enable_profiler: True
-

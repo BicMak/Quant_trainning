@@ -13,7 +13,7 @@ import numpy as np
 import os
 
 # 절대 경로로 import 수정
-from models.vit_block import QuantTimmVitBlock
+from models.vit import QuantTimmVitBlock
 from quant_config import QuantConfig, LayerQuantConfig
 from utils.config_loader import load_config_from_yaml
 from dataset import ImageNetMiniDataset, get_imagenet_transforms

@@ -13,41 +13,52 @@ from .layer_profiler.profiler import profiler
 
 class QAct(nn.Module):
     def __init__(self,
-                 quant_config:QuantConfig,
-                 act_module:nn.Module = None,
-                 layer_name:str = 'qact',
-                 enable_profiling:bool = False):
+                 quant_config: QuantConfig,
+                 act_module: nn.Module = None,
+                 layer_name: str = 'qact',
+                 num_heads: int = None,
+                 head_dim: int = None):
         super().__init__()
 
-        # quant_config에서 설정 추출
+        # Config 설정
         self.act_module = act_module
         self.layer_name = layer_name
-        self.enable_profiling = enable_profiling
-
         self.quant_config = quant_config
+        self.enable_profiling = quant_config.enable_profiler
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
             bits=quant_config.bit_type.bits,
-            signed=quant_config.bit_type.signed,
+            symmetric=quant_config.bit_type.symmetric,
             name=quant_config.bit_type.name
         )
         self.calibration_mode = quant_config.calibration_mode
         self.mode = 'fp32'
 
-        #1. set layer type & observer
-        self.observer = init_observers(self.observer_type,
-                                        self.bit_type,
-                                        'activation',
-                                        self.calibration_mode,
-                                        self.quant_config)
+        # Head 정보 저장 (head_wise 모드에서 사용)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
 
-        #2. quantizer build
+        # Observer 초기화 (head_wise 모드면 num_heads, head_dim 전달)
+        self.observer = init_observers(
+            self.observer_type,
+            self.bit_type,
+            'activation',
+            self.calibration_mode,
+            self.quant_config,
+            num_heads=num_heads,
+            head_dim=head_dim
+        )
+
+        # Quantizer 초기화
         self.quantizer = build_quantizer(
-            quantizer_str='uniform',
+            quantizer_str=quant_config.quantization_method.lower(),
             bit_type=self.bit_type,
-            module_type='activation')
+            module_type='activation',
+            num_heads=num_heads,
+            head_dim=head_dim
+        )
 
-        #3. profiler 초기화
+        # profiler 초기화
         self.profiler = None
         if self.enable_profiling:
             self.profiler = profiler(layer_name)
@@ -57,6 +68,8 @@ class QAct(nn.Module):
         with torch.no_grad():
             if self.act_module is not None:
                 x = self.act_module(x)
+
+            # Observer가 head_wise 처리를 자동으로 함
             self.observer.update(x)
             output = x
 
@@ -69,13 +82,7 @@ class QAct(nn.Module):
         # quantizer에 quantization param 설정
         self.quantizer.update_quantization_params(
             self.scaler, self.zero
-            )
-
-        # profiler에 weight 업데이트 (activation의 경우 calibration 데이터 사용)
-        if self.enable_profiling and self.profiler is not None:
-            # QAct는 weight가 없으므로 observer의 min/max 값을 저장
-            # 실제 activation 값은 forward에서 기록됨
-            pass
+        )
 
         return (self.scaler, self.zero)
 
@@ -103,8 +110,8 @@ class QAct(nn.Module):
             return None
 
         try:
-            stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
-            hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+            stats = self.profiler.get_statistic() if len(self.profiler.weight_batch_list) > 0 else None
+            hist = self.profiler.get_hist() if len(self.profiler.weight_batch_list) > 0 else None
         except (ValueError, AttributeError):
             # update_weight()가 아직 호출되지 않은 경우
             stats = None
@@ -122,8 +129,7 @@ class QAct(nn.Module):
         if self.enable_profiling and self.profiler is not None:
             self.profiler.reset_time_profiler()
             self.profiler.reset_memory_profiler()
-            self.profiler.weight = None
-            self.profiler.quant_weight = None
+            self.profiler.clear_batches()
 
 
     def forward(self, x):
@@ -138,7 +144,7 @@ class QAct(nn.Module):
                 with self.profiler.measure_time():
                     # Store FP32 output before quantization
                     fp32_output = x.clone().detach()
-                    # Fake quantization: quant -> dequant
+                    # Fake quantization: quant -> dequant (quantizer가 head_wise 처리)
                     x = self.quantizer.forward(x)
                     # Update profiler with FP32 vs Quantized outputs
                     self.profiler.update_weight(fp32_output, x.detach())
@@ -167,9 +173,10 @@ def test_qact_profiling():
 
     # Create test config (QuantConfig, BitTypeConfig already imported at top)
     config = QuantConfig(
-        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
-        observer_type='minmax',
-        calibration_mode='layer_wise'
+        bit_type=BitTypeConfig(bits=8, symmetric=True, name='int8'),
+        observer_type='MinmaxObserver',
+        calibration_mode='layer_wise',
+        enable_profiler=True
     )
 
     # Create QAct with profiling enabled
@@ -177,8 +184,7 @@ def test_qact_profiling():
     layer = QAct(
         quant_config=config,
         act_module=None,
-        layer_name='test_qact',
-        enable_profiling=True
+        layer_name='test_qact'
     )
     print("  ✓ QAct created")
     print(f"  Layer name: {layer.layer_name}")

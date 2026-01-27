@@ -21,14 +21,17 @@ class KLObserver(BaseObserver):
                  bit_type,
                  module_type,
                  calibration_mode,
-                 hist_bins=2048):
-        super(KLObserver, self).__init__(bit_type, module_type, calibration_mode)
+                 hist_bins=2048,
+                 num_heads=None,
+                 head_dim=None):
+        super(KLObserver, self).__init__(bit_type, module_type, calibration_mode,
+                                         num_heads=num_heads, head_dim=head_dim)
 
         self.max_val = None
         self.min_val = None
         self.percentile_sigma = 0.01  #Fixed
         self.percentile_alpha = 0.99999     #Fixed
-        self.symmetric = self.bit_type.signed
+        self.symmetric = self.bit_type.symmetric
 
         self.start_ratio = 0.1  # start searching from 10% of bins
         self.hist_bins = hist_bins
@@ -247,7 +250,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'conv_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'hist_bins': 512  # Reduced for faster testing
         },
         {
@@ -256,7 +259,7 @@ def main():
             'input_shape': (4, 32),
             'module_type': 'linear_weight',
             'use_weight': True,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'hist_bins': 512
         },
         {
@@ -268,7 +271,7 @@ def main():
             'input_shape': (4, 3, 32, 32),
             'module_type': 'activation',
             'use_weight': False,
-            'bit_type': BitType(bits=8, signed=True, name='int8_signed'),
+            'bit_type': BitType(bits=8, symmetric=True, name='int8_symmetric'),
             'hist_bins': 512
         },
     ]

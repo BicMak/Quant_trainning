@@ -6,14 +6,18 @@ from ..bit_type import BitType
 from .base import BaseObserver
 
 class MinmaxObserver(BaseObserver):
-    def __init__(self, 
-                 bit_type, 
-                 module_type, 
-                 calibration_mode):
-        super(MinmaxObserver, self).__init__(bit_type, 
+    def __init__(self,
+                 bit_type,
+                 module_type,
+                 calibration_mode,
+                 num_heads=None,
+                 head_dim=None):
+        super(MinmaxObserver, self).__init__(bit_type,
                                              module_type,
-                                             calibration_mode)
-        self.symmetric = self.bit_type.signed
+                                             calibration_mode,
+                                             num_heads=num_heads,
+                                             head_dim=head_dim)
+        self.symmetric = self.bit_type.symmetric
         self.max_val = None
         self.min_val = None
         self.device = None
@@ -47,6 +51,8 @@ class MinmaxObserver(BaseObserver):
         if self.calibration_mode == 'layer_wise':
             self.max_val = self.max_val.max()
             self.min_val = self.min_val.min()
+        # head_wise: 이미 reshape_tensor에서 (num_heads, ...) 형태로 변환됨
+        # 별도 처리 불필요 (channel_wise와 동일하게 head별 min/max 유지)
 
     def get_quantization_params(self, *args, **kwargs):
         max_val = self.max_val

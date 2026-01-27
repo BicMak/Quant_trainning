@@ -8,11 +8,13 @@ from ..bit_type import BitType
 
 
 class OmseObserver(BaseObserver):
-    def __init__(self, bit_type, module_type, calibration_mode):
+    def __init__(self, bit_type, module_type, calibration_mode,
+                 num_heads=None, head_dim=None):
         # Activation도 이제 지원 가능!
-        super().__init__(bit_type, module_type, calibration_mode)
+        super().__init__(bit_type, module_type, calibration_mode,
+                         num_heads=num_heads, head_dim=head_dim)
         
-        self.symmetric = self.bit_type.signed
+        self.symmetric = self.bit_type.symmetric
         self.max_val = None
         self.min_val = None
         self.calibration_data = []  # FP32 배치들을 저장

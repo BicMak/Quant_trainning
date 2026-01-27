@@ -10,26 +10,25 @@ from .layer_profiler.profiler import profiler
 class QuantIntSoft(nn.Module):
 
     def __init__(self,
-                 input_module:nn.Module,
-                 quant_config:QuantConfig,
-                 layer_name:str = 'qintsoft',
-                 enable_profiling:bool = False):
+                 input_module: nn.Module,
+                 quant_config: QuantConfig,
+                 layer_name: str = 'qintsoft'):
         super(QuantIntSoft, self).__init__()
 
-        #0. observer config copy
+        # Config 설정
         self.layer_name = layer_name
-        self.enable_profiling = enable_profiling
         self.observer_config = quant_config
+        self.enable_profiling = quant_config.enable_profiler
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
             bits=quant_config.bit_type.bits,
-            signed=quant_config.bit_type.signed,
+            symmetric=quant_config.bit_type.symmetric,
             name=quant_config.bit_type.name
         )
         self.calibration_mode = quant_config.calibration_mode
         self.mode = 'fp32'
 
-        self.PTQ = True #PTQ or I-bert
+        self.PTQ = True  # PTQ or I-bert
 
         # Observer와 Log2Quantizer 초기화
         self.observer = init_observers(
@@ -123,8 +122,8 @@ class QuantIntSoft(nn.Module):
             return None
 
         try:
-            stats = self.profiler.get_statistic() if self.profiler.weight is not None else None
-            hist = self.profiler.get_hist() if self.profiler.weight is not None else None
+            stats = self.profiler.get_statistic() if len(self.profiler.weight_batch_list) > 0 else None
+            hist = self.profiler.get_hist() if len(self.profiler.weight_batch_list) > 0 else None
         except (ValueError, AttributeError):
             # update_weight()가 아직 호출되지 않은 경우
             stats = None
@@ -142,8 +141,7 @@ class QuantIntSoft(nn.Module):
         if self.enable_profiling and self.profiler is not None:
             self.profiler.reset_time_profiler()
             self.profiler.reset_memory_profiler()
-            self.profiler.weight = None
-            self.profiler.quant_weight = None
+            self.profiler.clear_batches()
 
     @staticmethod
     def log_round(x):
@@ -323,9 +321,10 @@ def test_quantintsoft_profiling():
 
     # Create test config
     config = QuantConfig(
-        bit_type=BitTypeConfig(bits=8, signed=True, name='int8'),
-        observer_type='minmax',
-        calibration_mode='layer_wise'
+        bit_type=BitTypeConfig(bits=8, symmetric=True, name='int8'),
+        observer_type='MinmaxObserver',
+        calibration_mode='layer_wise',
+        enable_profiler=True
     )
 
     # Test PTQ Mode
@@ -338,8 +337,7 @@ def test_quantintsoft_profiling():
     layer_ptq = QuantIntSoft(
         input_module=None,
         quant_config=config,
-        layer_name='test_intsoft_ptq',
-        enable_profiling=True
+        layer_name='test_intsoft_ptq'
     )
     layer_ptq.PTQ = True
     print("  ✓ QuantIntSoft created")
@@ -430,8 +428,7 @@ def test_quantintsoft_profiling():
     layer_ibert = QuantIntSoft(
         input_module=None,
         quant_config=config,
-        layer_name='test_intsoft_ibert',
-        enable_profiling=True
+        layer_name='test_intsoft_ibert'
     )
     layer_ibert.PTQ = False
     layer_ibert.input_scale = torch.tensor(0.1)  # Simulated input scale

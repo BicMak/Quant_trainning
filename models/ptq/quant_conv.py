@@ -28,14 +28,14 @@ class QuantConv2d(nn.Module):
         self.observer_type = quant_config.observer_type
         self.bit_type = BitType(
             bits=quant_config.bit_type.bits,
-            signed=quant_config.bit_type.signed,
+            symmetric=quant_config.bit_type.symmetric,
             name=quant_config.bit_type.name
         )
 
-        # Hardcoded weight bit type (signed=True for weights)
+        # Hardcoded weight bit type (symmetric=True for weights)
         self.weight_bit_type = BitType(
             bits=quant_config.bit_type.bits,
-            signed=True,  # Hardcoded for weights
+            symmetric=True,  # Hardcoded for weights
             name=f"int{quant_config.bit_type.bits}_weight"
         )
 
@@ -45,7 +45,7 @@ class QuantConv2d(nn.Module):
 
         #1. set layer type & observer
         self.observer = init_observers("MinmaxObserver",  # Hardcoded
-                                        self.weight_bit_type,  # Hardcoded signed=True
+                                        self.weight_bit_type,  # Hardcoded symmetric=True
                                         'conv_weight',  # Hardcoded
                                         self.calibration_mode,
                                         self.quant_config)
