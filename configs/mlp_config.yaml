@@ -49,14 +49,14 @@ mlp_fc2:
     kl_bins: 2048
     enable_profiler: True
   output:
-    calibration_mode: layer_wise  # channel_wise → layer_wise로 변경 (클리핑 방지)
+    calibration_mode: channel_wise  # channel_wise → layer_wise로 변경 (클리핑 방지)
     bit_type:
       bits: 8
       symmetric: True  # 범위가 대칭적이므로 symmetric 사용
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: OmseObserver
     quantization_method: Uniform
-    percentile_alpha: 0.9999
+    percentile_alpha: 0.99995
     percentile_sigma: 0.1
     kl_bins: 2048
     enable_profiler: True
@@ -67,14 +67,14 @@ mlp_fc2:
 # GELU activation output quantization (fc1 출력 후)
 # GELU 출력은 asymmetric (0 이상만은 아니지만 분포가 치우침)
 mlp_gelu:
-  calibration_mode: layer_wise
+  calibration_mode: channel_wise
   bit_type:
     bits: 8
     symmetric: False
     name: int8
-  observer_type: MinmaxObserver
+  observer_type: OmseObserver
   quantization_method: Uniform
-  percentile_alpha: 0.9999
+  percentile_alpha: 0.99995
   percentile_sigma: 0.1
   kl_bins: 2048
   enable_profiler: True

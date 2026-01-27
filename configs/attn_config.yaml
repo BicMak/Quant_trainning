@@ -24,9 +24,9 @@ attn_qkv:
       bits: 8
       symmetric: False
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
-    percentile_alpha: 0.999
+    percentile_alpha: 0.99995
     percentile_sigma: 0.2
     kl_bins: 2048
     enable_profiler: True
@@ -40,7 +40,7 @@ attn_proj:
       bits: 8
       symmetric: True
       name: int8
-    observer_type: MinmaxObserver
+    observer_type: PercentileObserver
     quantization_method: Uniform
     percentile_alpha: 0.9995
     percentile_sigma: 0.1
@@ -72,7 +72,7 @@ attn_q_out:
     name: int8
   observer_type: PercentileObserver
   quantization_method: Uniform
-  percentile_alpha: 0.99999
+  percentile_alpha: 0.99995
   percentile_sigma: 0.01
   kl_bins: 2048
   enable_profiler: True
@@ -86,7 +86,7 @@ attn_k_out:
     name: int8
   observer_type: PercentileObserver
   quantization_method: Uniform
-  percentile_alpha: 0.999
+  percentile_alpha: 0.99995
   percentile_sigma: 0.1
   kl_bins: 2048
   enable_profiler: True
@@ -100,7 +100,7 @@ attn_v_input:
     name: int8
   observer_type: PercentileObserver
   quantization_method: Uniform
-  percentile_alpha: 0.999
+  percentile_alpha: 0.99995
   percentile_sigma: 0.1
   kl_bins: 2048
   enable_profiler: True
@@ -114,9 +114,9 @@ attn_kv_out:
     bits: 8
     symmetric: False
     name: int8
-  observer_type: MinmaxObserver
+  observer_type: PercentileObserver
   quantization_method: Uniform
-  percentile_alpha: 0.999
+  percentile_alpha: 0.99995
   percentile_sigma: 0.1
   kl_bins: 2048
   enable_profiler: True
@@ -130,10 +130,10 @@ attn_v_out:
     bits: 8
     symmetric: True
     name: int8
-  observer_type: MinmaxObserver
+  observer_type: PercentileObserver
   quantization_method: Uniform
-  percentile_alpha: 0.9999
-  percentile_sigma: 0.01
+  percentile_alpha: 0.99995
+  percentile_sigma: 0.05
   kl_bins: 2048
   enable_profiler: True
 
@@ -145,7 +145,7 @@ intSoft:
     bits: 8
     symmetric: False
     name: int8
-  observer_type: MinmaxObserver
+  observer_type: OmseObserver
   quantization_method: Uniform
   percentile_alpha: 0.9995
   percentile_sigma: 0.1

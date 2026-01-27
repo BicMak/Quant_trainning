@@ -11,11 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from pathlib import Path
-from datetime import datetime
 import json
 
 from models.quant_vit import QVit
 from utils.imagenet_dataset import get_imagenet_loader, CustomImageNetDataset, get_imagenet_transforms
+from utils.log_editor import save_qvit_profiler_results
 
 
 def compute_sqnr(fp32_out, quant_out):
@@ -216,27 +216,35 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
     # 7. Save results
     if save_results:
         print("\n[7] Saving results...")
+
+        # Save profiler results (CSV, histograms, summary)
         log_dir = Path(__file__).parent / 'log' / 'qvit'
-        log_dir.mkdir(parents=True, exist_ok=True)
+        saved_files = save_qvit_profiler_results(
+            qvit,
+            base_log_dir=str(log_dir),
+            prefix="qvit"
+        )
+        print(f"  Results saved to: {saved_files['directory']}")
+        print(f"  - CSV: {Path(saved_files['csv']).name if saved_files['csv'] else 'N/A'}")
+        print(f"  - Histograms: {len(saved_files['histograms'])} files")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # Save summary
+        # Also save test summary to the same directory
         summary = {
-            'timestamp': timestamp,
             'model': 'vit_base_patch16_224',
             'num_blocks': qvit.num_blocks,
             'total_sqnr': sqnr,
             'cosine_similarity': cos_sim,
             'prediction_match_rate': match_rate,
-            'block_sqnr': block_sqnr,
-            'avg_block_sqnr': avg_block_sqnr
+            'block_sqnr_independent': block_sqnr_indep,
+            'block_sqnr_cumulative': block_sqnr,
+            'avg_block_sqnr_independent': avg_indep,
+            'avg_block_sqnr_cumulative': avg_block_sqnr
         }
 
-        summary_file = log_dir / f"qvit_summary_{timestamp}.json"
-        with open(summary_file, 'w') as f:
+        test_summary_file = Path(saved_files['directory']) / "test_summary.json"
+        with open(test_summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
-        print(f"  Summary saved: {summary_file.name}")
+        print(f"  - Test summary: {test_summary_file.name}")
 
     # 8. Quality assessment
     print("\n" + "=" * 70)

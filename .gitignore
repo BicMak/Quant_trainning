@@ -62,3 +62,8 @@ datasets/
 *.bak
 .cache/
 
+# Log files (images)
+log/**/*.png
+log/**/*.jpg
+log/**/*.jpeg
+
