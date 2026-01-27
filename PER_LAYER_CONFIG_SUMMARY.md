@@ -1,231 +1,68 @@
-# Per-Layer Quantization Configuration Update
+# block 단위에서 양자화가 안나왔던 이유
 
-## Summary
 
-Updated the quantization configuration system to support per-layer configurations for the attention block, allowing fine-grained control over each layer's quantization settings.
-
-## Changes Made
-
-### 1. [configs/attn_config.yaml](configs/attn_config.yaml)
-
-**Before (Global format):**
-```yaml
-outputs:
-  calibration_mode: channel_wise
-  bit_type: ...
-
-weight:
-  calibration_mode: channel_wise
-  ...
-
-activation:
-  ...
-```
-
-**After (Per-layer format):**
-```yaml
-# Linear layers (have both weight and output configs)
-attn_qkv:
-  weight:
-    calibration_mode: channel_wise
-    bit_type:
-      bits: 8
-      signed: True
-    observer_type: MinmaxObserver
-    enable_profiler: True
-  output:
-    calibration_mode: channel_wise
-    bit_type:
-      bits: 8
-      signed: False
-    observer_type: MinmaxObserver
-    enable_profiler: True
-    output_quant_enable: False
-
-attn_proj:
-  weight: ...
-  output: ...
-
-# QAct layers (single config each)
-attn_q_out:
-  calibration_mode: channel_wise
-  bit_type:
-    bits: 8
-    signed: True  # Changed from False to handle negative values
-  observer_type: MinmaxObserver
-  enable_profiler: True
-
-attn_k_out:
-  ...
-
-attn_v_input:
-  ...
-
-attn_kv_out:
-  ...
-
-attn_v_out:
-  ...
-
-# IntSoftmax
-intSoft:
-  ...
-```
-
-### 2. [utils/config_loader.py](utils/config_loader.py)
-
-**Key Changes:**
-- Added automatic format detection (global vs per-layer)
-- Supports both formats for backward compatibility
-- Per-layer configs are returned as:
-  - `dict` with `'weight'` and `'output'` keys for QuantLinear layers
-  - `QuantConfig` object for QAct/IntSoft layers
-
-**Example Usage:**
+### Query, Key, Value의 가중치 차이로 인한 문제
 ```python
-configs = load_config_from_yaml('configs/attn_config.yaml')
-
-# Per-layer format:
-attn_qkv_weight_config = configs['attn_qkv']['weight']
-attn_qkv_output_config = configs['attn_qkv']['output']
-attn_q_out_config = configs['attn_q_out']
-
-# Global format (legacy, still supported):
-weight_config = configs['weight']
-output_config = configs['output']
+# input shape (B, N, D)
+# qkv shape: (B, N, 3*C) = (B, N, 2304)
+qkv = self.attn_qkv.forward(x)
 ```
+- 상기 코드에서 보면 연산상의 편의를 위해서 QKV를 하나의 Linear로 구현되어 있지만 양자화 입장에서는 좋은선택이 아님
+- channel wise 양자화를 하게 되면 임베딩 채널을 피봇으로 해서 양자화를 진행하게 됨
+- 하지만 Q,K,V 의 각각의 블록에서필요한 weight의 range가 서로 다르기 때문에 channel wise로 하게 되면 scale의 값이 커지게 됨
+- 따라서 QKV를 분리를 하고 나서 양자화를 해야함
 
-### 3. [models/quant_attn.py](models/quant_attn.py)
-
-**Key Changes:**
-- Added `get_layer_config()` helper function to handle both formats
-- Updated all layer initializations to use per-layer configs
-- Backward compatible with global format
-
-**Before:**
 ```python
-self.attn_qkv = QuantLinear(
-    input_module=block.attn.qkv,
-    out_config=configs['output'],
-    weight_config=configs['weight'],
-    layer_name='attn_qkv'
-)
+# QKV projection (output_quant_enable=False이므로FP32 출력)
+# qkv shape: (B, N, 3*C) = (B, N, 2304)
+qkv = self.attn_qkv.forward(x)
 
-self.attn_q_out = QAct(
-    quant_config=configs.get('activation', configs['output']),
-    act_module=None,
-    layer_name='attn_q_out'
-)
+# QKV 분리: Linear 직후 바로 슬라이싱 
+# qkv: (B, N, 2304) → q, k, v 각각 (B, N, 768)
+q = qkv[:, :, :C]              # (B, N, C)
+k = qkv[:, :, C:2*C]           # (B, N, C)
+v = qkv[:, :, 2*C:]            # (B, N, C)
+# Q, K, V 각각 양자화 (아직 head 분리 전)
+q = self.attn_q_out.forward(q)  # (B, N, C)
+k = self.attn_k_out.forward(k)  # (B, N, C)
+v = self.attn_v_input.forward(v)  # (B, N, C)
+```
+- 아래 이미지를 보면 linear 가중치 적용 후 query와 key는 유사한 분포를 가지고 있지만 value 같은경우에는 상단의 2개의 값과 분포가 차이가 발생함
+![alt text](image.png)
+![alt text](image-1.png)
+![alt text](image-2.png)
+
+### 중복 양자화 문제
+```python 
+ dequant_weight = self.weight_quantizer.dequantize(self.quant_weight)
+ # 2. Linear operation in fp32
+ out_fp32 = self.fwd_func(x, dequant_weight, self.bias, **self.fwd_kwargs)
+ # 3. Output quantization (선택적)
+ if self.output_quant_enable:
+     # Output quantization이 활성화된 경우
+     if self.enable_profiling and self.output_profiler is not None:
+         with self.output_profiler.measure_time():
+             # Store FP32 output before quantization
+             fp32_output = out_fp32.clone().detach()
+             # Output fake quantization
+             output = self.output_quantizer.forward(out_fp32)
+             # Update output profiler with FP32 vs Quantized outputs
+             self.output_profiler.update_weight(fp32_output, output.detach())
 ```
 
-**After:**
-```python
-def get_layer_config(layer_name):
-    if layer_name in configs:
-        return configs[layer_name]
-    # Fallback to global configs
-    if layer_name in ['attn_qkv', 'attn_proj']:
-        return {'weight': configs.get('weight'), 'output': configs.get('output')}
-    else:
-        return configs.get('activation', configs.get('output'))
+- 실제 구현에서 forward(), 순전파를 구현할때 정확도를 떨어트리는 중요 요인
+- self.quant_weight 가 사전에 양자화가 되어있는 상태였다면, 해당구간에서 순전파를 했다면 양자화가 2번 적용되어서 가중치값이 손실이 누적됨
 
-qkv_config = get_layer_config('attn_qkv')
-self.attn_qkv = QuantLinear(
-    input_module=block.attn.qkv,
-    out_config=qkv_config['output'] if isinstance(qkv_config, dict) else configs['output'],
-    weight_config=qkv_config['weight'] if isinstance(qkv_config, dict) else configs['weight'],
-    layer_name='attn_qkv'
-)
+### Per-channel로 양자화르 했을떄 오히려 스코어가 떨어 질 수 있음
 
-self.attn_q_out = QAct(
-    quant_config=get_layer_config('attn_q_out'),
-    act_module=None,
-    layer_name='attn_q_out'
-)
-```
+- Per-channel은 각 채널마다 독립적인 스케일을 계산, 즉 vit 기준으로 patch가 197개가 존재하고 이것만으로 양자화를 계산하기 때문에 작은 outlier에 예민하게 값이 변함
+- 채널 A와 채널 B 사이의 상대적 관계를 반영하지 않아 채널간의 편차를 무시하게 됨
 
-## Layer Configurations
+  * **Per-tensor (Layer-wise)일 때:** 하나의 큰 스케일로 전체를 나누기 때문에, 양자화 후에도 B는 A보다 대략 3배 큰 정수 값을 유지합니다. **상대적 관계가 보존됩니다.**
+  * **Per-channel일 때:**
+  * 채널 A는  범위에 맞춰 스케일을 잡고 INT8의 를 꽉 채웁니다.
+  * 채널 B는  범위에 맞춰 스케일을 잡고 INT8의 를 꽉 채웁니다.
+  * **결과:** 양자화된 공간(Integer Domain)에서 보면 A와 B 모두 비슷한  근처의 값을 가지게 됩니다. 하드웨어가 다시 이를 복원(Dequantize)할 때 각기 다른 스케일을 곱해주긴 하지만, 이 과정에서 발생하는 **반올림 오차(Rounding Error)의 크기**가 채널별로 달라지면서 원래의 "3배 차이"라는 정교한 비율이 미세하게 틀어집니다.
 
-The attention block now has 8 separately configurable layers:
 
-### QuantLinear Layers (Weight + Output configs):
-1. **attn_qkv**: QKV projection layer
-   - Weight: 8-bit signed (int8), channel_wise, MinmaxObserver
-   - Output: 8-bit unsigned (uint8), channel_wise, MinmaxObserver, **disabled** (output_quant_enable: False)
 
-2. **attn_proj**: Output projection layer
-   - Weight: 8-bit signed (int8), channel_wise, MinmaxObserver
-   - Output: 8-bit unsigned (uint8), channel_wise, MinmaxObserver, **disabled** (output_quant_enable: False)
-
-### QAct Layers (Single config):
-3. **attn_q_out**: Q output quantization after QKV split
-   - 8-bit **signed** (int8), channel_wise, MinmaxObserver
-
-4. **attn_k_out**: K output quantization after QKV split
-   - 8-bit **signed** (int8), channel_wise, MinmaxObserver
-
-5. **attn_v_input**: V input quantization after QKV split
-   - 8-bit **signed** (int8), channel_wise, MinmaxObserver
-
-6. **attn_kv_out**: Attention score quantization (Q @ K^T output)
-   - 8-bit **signed** (int8), channel_wise, MinmaxObserver
-
-7. **attn_v_out**: Attention @ V output quantization
-   - 8-bit **signed** (int8), channel_wise, MinmaxObserver
-
-### IntSoftmax Layer:
-8. **intSoft**: Integer softmax approximation
-   - 8-bit unsigned (uint8), channel_wise, MinmaxObserver
-
-## Key Improvements
-
-1. **Individual Layer Control**: Each layer can now have different:
-   - Bit width (bits)
-   - Signed vs unsigned quantization
-   - Observer type (MinmaxObserver, PercentileObserver, KLObserver)
-   - Calibration mode (channel_wise, layer_wise)
-   - Percentile parameters
-
-2. **Fixed Signed/Unsigned Issues**:
-   - Q, K, V now use **signed** quantization (was unsigned)
-   - This properly handles negative values in attention computation
-
-3. **Backward Compatibility**:
-   - Code still supports global format configs
-   - Automatic format detection
-
-4. **Better Debugging**:
-   - Each layer's config is explicit and visible in the YAML
-   - Easier to experiment with different quantization strategies per layer
-
-## Testing
-
-To test the new configuration:
-
-```bash
-python test_quant_attn.py
-# or
-python test_embed_to_attn.py
-```
-
-The config loader will automatically detect the per-layer format and use it.
-
-## Migration Guide
-
-**If you have existing global format configs:**
-
-No changes needed! The config loader automatically detects the format and handles both.
-
-**If you want to use per-layer configs:**
-
-1. Create a new YAML file with per-layer structure (see [configs/attn_config.yaml](configs/attn_config.yaml))
-2. Define configs for each layer: `attn_qkv`, `attn_proj`, `attn_q_out`, `attn_k_out`, `attn_v_input`, `attn_kv_out`, `attn_v_out`, `intSoft`
-3. Use the same `load_config_from_yaml()` function - it automatically detects the format
-
-## Next Steps
-
-You can now experiment with different quantization settings for each layer to improve SQNR:
-
-- Try different observers (MinmaxObserver, PercentileObserver, KLObserver) for attn_kv_out
-- Adjust bit widths per layer if needed
-- Fine-tune percentile parameters for each layer independently
