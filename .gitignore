@@ -21,6 +21,7 @@ env/
 # PyTorch / ML
 *.pth
 *.pt
+*.onnx
 *.ckpt
 *.safetensors
 checkpoints/
@@ -67,3 +68,5 @@ log/**/*.png
 log/**/*.jpg
 log/**/*.jpeg
 
+export/*.data
+export/*.data
