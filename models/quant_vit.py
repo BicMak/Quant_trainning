@@ -55,7 +55,7 @@ class QVit(nn.Module):
         """
         super().__init__()
 
-        self.original_model = model
+
         config_dir = Path(config_dir)
 
         # Model info
@@ -272,6 +272,26 @@ class QVit(nn.Module):
         # Head
         if isinstance(self.head, QuantLinear):
             self.head.mode = mode
+
+    def set_profiling(self, enable: bool):
+        """Enable/disable profiling for all layers."""
+        self.enable_profiling = enable
+
+        # Embedding
+        if self.embedding is not None:
+            self.embedding.set_profiling(enable)
+
+        # Blocks
+        for block in self.blocks:
+            block.set_profiling(enable)
+
+        # Final Norm
+        if isinstance(self.norm, QLayerNorm):
+            self.norm.enable_profiling = enable
+
+        # Head
+        if isinstance(self.head, QuantLinear):
+            self.head.enable_profiling = enable
 
     def get_quantized_layers(self) -> Dict[str, nn.Module]:
         """Returns all quantized layers."""

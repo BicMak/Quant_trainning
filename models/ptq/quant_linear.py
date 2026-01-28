@@ -19,8 +19,7 @@ class QuantLinear(nn.Module):
                  layer_name: str = 'qlinear'):
         super().__init__()
 
-        # Config 설정
-        self.input_module = input_module
+        # Config 설정 (input_module 참조 저장하지 않음 - 메모리 절약)
         self.layer_name = layer_name
         self.out_config = out_config
         self.weight_config = weight_config
@@ -80,17 +79,17 @@ class QuantLinear(nn.Module):
             self.output_profiler = profiler(layer_name + '_output')
             self.weight_profiler = profiler(layer_name + '_weight')
 
-        # 4. Layer 초기화
+        # 4. Layer 초기화 - 필요한 값만 복사하고 원본 참조는 저장하지 않음
         self.fwd_kwargs = dict()
         self.fwd_func = F.linear
 
-        self.weight = self.input_module.weight.clone().detach()
+        self.weight = input_module.weight.clone().detach()
 
-        if self.input_module.bias is not None:
-            self.bias = self.input_module.bias.clone().detach()
+        if input_module.bias is not None:
+            self.bias = input_module.bias.clone().detach()
         else:
-            self.bias = torch.zeros(self.input_module.weight.size(0)).to(
-                self.input_module.weight.device
+            self.bias = torch.zeros(input_module.weight.size(0)).to(
+                input_module.weight.device
             )
 
         # Weight는 고정값이므로 바로 quantize

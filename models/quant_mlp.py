@@ -29,7 +29,7 @@ class QMlp(nn.Module):
                  config_path: Union[str, Path]):
         super().__init__()
 
-        self.original_block = block
+        # original_block 참조 저장하지 않음 - 메모리 절약
 
         # Config 로드
         configs = load_config_from_yaml(config_path)
@@ -140,6 +140,13 @@ class QMlp(nn.Module):
         for layer in self.get_quantized_layers().values():
             if hasattr(layer, 'mode'):
                 layer.mode = mode
+
+    def set_profiling(self, enable: bool):
+        """Enable/disable profiling for all layers."""
+        self.enable_profiling = enable
+        for layer in self.get_quantized_layers().values():
+            if hasattr(layer, 'enable_profiling'):
+                layer.enable_profiling = enable
 
     def get_profiler(self) -> Dict:
         """Get profiling results from all layers"""

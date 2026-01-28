@@ -19,8 +19,7 @@ class QLayerNorm(nn.Module):
                  layer_name: str = 'qlayernorm'):
         super().__init__()
 
-        # Config 설정
-        self.input_module = input_module
+        # Config 설정 (input_module 참조 저장하지 않음 - 메모리 절약)
         self.layer_name = layer_name
         self.quant_config = quant_config
         self.enable_profiling = quant_config.enable_profiler
@@ -34,10 +33,10 @@ class QLayerNorm(nn.Module):
         self.quant_weight = None
         self.mode = 'fp32'
 
-        #
-        self.normalized_shape = self.input_module.normalized_shape
-        self.eps = self.input_module.eps
-        self.num_channels = self.input_module.weight.size(0)
+        # 필요한 값만 복사
+        self.normalized_shape = input_module.normalized_shape
+        self.eps = input_module.eps
+        self.num_channels = input_module.weight.size(0)
 
         #LayerNorm specific params
         self.scale = None
@@ -62,13 +61,13 @@ class QLayerNorm(nn.Module):
         if self.enable_profiling:
             self.profiler = profiler(layer_name)
 
-        #4. layer initialization
+        #4. layer initialization - 필요한 값만 복사하고 원본 참조는 저장하지 않음
         self.fwd_kwargs = dict()
         self.fwd_func = F.layer_norm
 
-        self.weight = self.input_module.weight.clone().detach()
+        self.weight = input_module.weight.clone().detach()
 
-        self.bias = self.input_module.bias.clone().detach() if self.input_module.bias is not None else None
+        self.bias = input_module.bias.clone().detach() if input_module.bias is not None else None
 
     
     def calibration(self, x):

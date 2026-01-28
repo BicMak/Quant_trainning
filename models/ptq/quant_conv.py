@@ -21,7 +21,7 @@ class QuantConv2d(nn.Module):
         super().__init__()
 
         # quant_config에서 설정 추출
-        self.input_module = input_module
+
         self.layer_name = layer_name
         self.enable_profiling = enable_profiling
         self.quant_config = quant_config
@@ -75,19 +75,19 @@ class QuantConv2d(nn.Module):
 
         #4. layer initialization
         self.fwd_kwargs = dict(
-            stride=self.input_module.stride,
-            padding=self.input_module.padding,
-            dilation=self.input_module.dilation,
-            groups=self.input_module.groups,
+            stride=input_module.stride,
+            padding=input_module.padding,
+            dilation=input_module.dilation,
+            groups=input_module.groups,
         )
         self.fwd_func = F.conv2d
 
-        self.weight = self.input_module.weight.clone().detach()
-        if self.input_module.bias is not None:
-            self.bias = self.input_module.bias.clone().detach()
+        self.weight = input_module.weight.clone().detach()
+        if input_module.bias is not None:
+            self.bias = input_module.bias.clone().detach()
         else:
-            self.bias = torch.zeros(self.input_module.weight.size(0)).to(
-                self.input_module.weight.device
+            self.bias = torch.zeros(input_module.weight.size(0)).to(
+                input_module.weight.device
             )
 
     def calibration(self, x):

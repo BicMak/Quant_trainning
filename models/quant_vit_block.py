@@ -47,7 +47,6 @@ class QVitBlock(nn.Module):
         """
         super().__init__()
 
-        self.original_block = block
 
         # Load block-level config (for norm and residual)
         if block_config_path is not None:
@@ -250,6 +249,26 @@ class QVitBlock(nn.Module):
             self.residual1.mode = mode
         if self.residual2_quant_enable and self.residual2 is not None:
             self.residual2.mode = mode
+
+    def set_profiling(self, enable: bool):
+        """Enable/disable profiling for all layers."""
+        self.enable_profiling = enable
+
+        # LayerNorm
+        self.norm1.enable_profiling = enable
+        self.norm2.enable_profiling = enable
+
+        # Attention
+        self.attn.set_profiling(enable)
+
+        # MLP
+        self.mlp.set_profiling(enable)
+
+        # Residual (optional)
+        if self.residual1 is not None:
+            self.residual1.enable_profiling = enable
+        if self.residual2 is not None:
+            self.residual2.enable_profiling = enable
 
     def get_quantized_layers(self) -> Dict[str, nn.Module]:
         """Returns all quantized layers."""

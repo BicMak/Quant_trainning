@@ -35,7 +35,6 @@ class KLObserver(BaseObserver):
 
         self.start_ratio = 0.1  # start searching from 10% of bins
         self.hist_bins = hist_bins
-        self.v = None
         self.device = None
 
     def update(self, v: torch.Tensor):
@@ -50,7 +49,6 @@ class KLObserver(BaseObserver):
         # CUDA histogram을 위해 CPU로 이동
         v_cpu = v.cpu() if v.device.type == 'cuda' else v
         v_reshaped = self.reshape_tensor(v_cpu)
-        self.v = v_cpu.detach()
 
         # 1. Initialize min/max bounds using percentile
         self._cal_minmax(v_reshaped)

@@ -16,6 +16,7 @@ import json
 from models.quant_vit import QVit
 from utils.imagenet_dataset import get_imagenet_loader, CustomImageNetDataset, get_imagenet_transforms
 from utils.log_editor import save_qvit_profiler_results
+from utils.evaluation import ModelEvaluator, evaluate_model, compare_models
 
 
 def compute_sqnr(fp32_out, quant_out):
@@ -188,8 +189,70 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
     match_rate = (pred_orig == pred_quant).float().mean().item()
     print(f"    Prediction Match Rate: {match_rate * 100:.1f}%")
 
-    # 6. Per-block SQNR analysis
-    print("\n[6] Per-block SQNR analysis...")
+    # 6. Classification Evaluation (Precision, Recall, F1)
+    print("\n[6] Classification Evaluation...")
+
+    # Evaluation 전 profiler 비활성화 (메모리 절약)
+    # Forward 시 profiler가 텐서를 누적하여 메모리 폭발 방지
+    original_profiling_state = qvit.enable_profiling
+    qvit.set_profiling(False)
+    print("  Profiling disabled for evaluation (memory optimization)")
+
+    # Evaluation 데이터로더 준비
+    if use_real_data and imagenet_path.exists():
+        val_path = Path(__file__).parent / 'imagenet-mini' / 'val'
+        eval_path = val_path if val_path.exists() else imagenet_path
+
+        # 메모리 효율을 위해 작은 배치, 적은 샘플
+        eval_loader = get_imagenet_loader(
+            data_path=str(eval_path),
+            batch_size=20,  # 줄임
+            num_samples=10000,  # 줄임
+            shuffle=False,
+            num_workers=2,
+            img_size=224
+        )
+        num_classes = model.num_classes
+
+        # FP32 Original Model 평가
+        print("\n  [Original FP32 Model Evaluation]")
+        metrics_orig = evaluate_model(
+            model=model,
+            dataloader=eval_loader,
+            device=device,
+            num_classes=num_classes,
+            verbose=True
+        )
+
+        # 메모리 확보: 캐시 클리어
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # QVit Quantized Model 평가
+        print("\n  [QVit Quantized Model Evaluation]")
+        qvit.set_mode('quantized')
+        metrics_quant = evaluate_model(
+            model=qvit,
+            dataloader=eval_loader,
+            device=device,
+            num_classes=num_classes,
+            verbose=True
+        )
+
+        # 모델 비교
+        metrics_diff = compare_models(metrics_orig, metrics_quant, ('Original', 'Quantized'))
+    else:
+        print("  Skipping classification evaluation (no real data available)")
+        metrics_orig = {}
+        metrics_quant = {}
+        metrics_diff = {}
+
+    # Evaluation 후 profiler 상태 복원
+    qvit.set_profiling(original_profiling_state)
+    print("  Profiling state restored")
+
+    # 7. Per-block SQNR analysis
+    print("\n[7] Per-block SQNR analysis...")
 
     # Independent SQNR: each block's intrinsic quality
     print("\n  [Independent SQNR] - Each block's own quantization quality")
@@ -213,9 +276,9 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
     print("-" * 50)
     print(f"  Average: {avg_block_sqnr:.2f} dB")
 
-    # 7. Save results
+    # 8. Save results
     if save_results:
-        print("\n[7] Saving results...")
+        print("\n[8] Saving results...")
 
         # Save profiler results (CSV, histograms, summary)
         log_dir = Path(__file__).parent / 'log' / 'qvit'
@@ -238,7 +301,12 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
             'block_sqnr_independent': block_sqnr_indep,
             'block_sqnr_cumulative': block_sqnr,
             'avg_block_sqnr_independent': avg_indep,
-            'avg_block_sqnr_cumulative': avg_block_sqnr
+            'avg_block_sqnr_cumulative': avg_block_sqnr,
+            'classification_metrics': {
+                'original': metrics_orig,
+                'quantized': metrics_quant,
+                'diff': metrics_diff
+            }
         }
 
         test_summary_file = Path(saved_files['directory']) / "test_summary.json"
@@ -246,7 +314,7 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
             json.dump(summary, f, indent=2)
         print(f"  - Test summary: {test_summary_file.name}")
 
-    # 8. Quality assessment
+    # 9. Quality assessment
     print("\n" + "=" * 70)
     print("Quality Assessment")
     print("=" * 70)
@@ -266,6 +334,23 @@ def test_qvit(num_blocks: int = None, save_results: bool = True, use_real_data: 
         print(f"  ○ Cosine Similarity: {cos_sim:.6f} (0.95-0.99)")
     else:
         print(f"  △ Cosine Similarity: {cos_sim:.6f} (< 0.95)")
+
+    # Classification metrics summary
+    if metrics_quant:
+        print(f"\n  Classification Metrics (Quantized):")
+        print(f"    Accuracy:  {metrics_quant.get('accuracy', 0):.2f}%")
+        print(f"    Precision: {metrics_quant.get('precision', 0):.4f}")
+        print(f"    Recall:    {metrics_quant.get('recall', 0):.4f}")
+        print(f"    F1 Score:  {metrics_quant.get('f1', 0):.4f}")
+
+        if metrics_diff:
+            acc_drop = metrics_diff.get('accuracy_diff', 0)
+            if abs(acc_drop) < 1.0:
+                print(f"  ✓ Accuracy drop: {acc_drop:+.2f}% (< 1%)")
+            elif abs(acc_drop) < 3.0:
+                print(f"  ○ Accuracy drop: {acc_drop:+.2f}% (1-3%)")
+            else:
+                print(f"  △ Accuracy drop: {acc_drop:+.2f}% (> 3%)")
 
     print("=" * 70)
     print("QVit Test Completed!")

@@ -30,7 +30,8 @@ class QEmbedding(nn.Module):
                  config_path: Union[str, Path]):
         super().__init__()
 
-        self.original_model = model
+        # original_model 참조 저장하지 않음 - 메모리 절약
+        # 필요한 부분만 개별적으로 참조 저장
         patch_embed = model.patch_embed
 
         # Config 로드: YAML 파일에서 각 레이어별 config를 로드
@@ -160,6 +161,12 @@ class QEmbedding(nn.Module):
         """Set quantization mode ('fp32' or 'quantized')."""
         if hasattr(self.embed_output, 'mode'):
             self.embed_output.mode = mode
+
+    def set_profiling(self, enable: bool):
+        """Enable/disable profiling for all layers."""
+        self.enable_profiling = enable
+        if hasattr(self.embed_output, 'enable_profiling'):
+            self.embed_output.enable_profiling = enable
 
     def get_quantized_layers(self) -> Dict[str, nn.Module]:
         """Returns all quantized layers."""
