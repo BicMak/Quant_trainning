@@ -41,6 +41,12 @@ class QuantLinear(nn.Module):
         self.quant_weight = None
         self.mode = 'fp32'
 
+        # Quantization params - register_buffer로 ONNX initializer로 인식되게 함
+        self.register_buffer('weight_scaler', None)
+        self.register_buffer('weight_zero', None)
+        self.register_buffer('output_scaler', None)
+        self.register_buffer('output_zero', None)
+
         # 1. Observers 초기화
         # Weight observer (weight config 사용)
         self.weight_observer = init_observers(

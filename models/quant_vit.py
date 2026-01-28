@@ -507,3 +507,160 @@ class QVit(nn.Module):
         from utils.hessian_analyzer import analyze_block_sensitivity
 
         return analyze_block_sensitivity(self, data_loader, num_samples)
+
+    def strip_for_deploy(self):
+        """
+        Remove unnecessary components for deployment.
+
+        Removes:
+            - Observer: Calibration 전용, inference에 불필요
+            - Profiler: 개발/디버깅 전용
+
+        Keeps:
+            - Quantizer: scale, zero_point 보유, forward에서 사용
+            - quant_weight: INT8 weight 저장
+        """
+        removed_count = {'observer': 0, 'profiler': 0}
+
+        for name, module in self.named_modules():
+            # Observer 제거
+            for attr in ['observer', 'output_observer', 'weight_observer']:
+                if hasattr(module, attr) and getattr(module, attr) is not None:
+                    setattr(module, attr, None)
+                    removed_count['observer'] += 1
+
+            # Profiler 제거
+            for attr in ['profiler', 'output_profiler', 'weight_profiler']:
+                if hasattr(module, attr) and getattr(module, attr) is not None:
+                    setattr(module, attr, None)
+                    removed_count['profiler'] += 1
+
+            # enable_profiling 플래그 비활성화
+            if hasattr(module, 'enable_profiling'):
+                module.enable_profiling = False
+
+        print(f"[QVit] Stripped for deployment:")
+        print(f"  - Observers removed: {removed_count['observer']}")
+        print(f"  - Profilers removed: {removed_count['profiler']}")
+
+        return self
+
+    def export_onnx(self,
+                    save_path: str,
+                    input_shape: tuple = (1, 3, 224, 224),
+                    opset_version: int = 18,
+                    simplify: bool = True):
+        """
+        Export model to ONNX format for deployment.
+
+        Args:
+            save_path: Path to save ONNX file
+            input_shape: Input tensor shape (B, C, H, W)
+            opset_version: ONNX opset version (18+ recommended)
+            simplify: Run onnx-simplifier after export
+
+        Usage:
+            qvit.strip_for_deploy()
+            qvit.export_onnx('qvit_int8.onnx')
+        """
+        import torch.onnx
+
+        # 1. Set to eval & quantized mode
+        self.eval()
+        self.set_mode('quantized')
+        self.set_profiling(False)
+
+        # 2. Dummy input
+        device = next(self.parameters()).device
+        dummy_input = torch.randn(*input_shape).to(device)
+
+        # 3. Export
+        print(f"[QVit] Exporting to ONNX: {save_path}")
+        torch.onnx.export(
+            self,
+            dummy_input,
+            save_path,
+            opset_version=opset_version,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            },
+            do_constant_folding=True
+        )
+        print(f"  - ONNX export complete")
+
+        # 4. Simplify (optional)
+        if simplify:
+            try:
+                import onnx
+                from onnxsim import simplify as onnx_simplify
+
+                print(f"  - Running onnx-simplifier...")
+                model = onnx.load(save_path)
+                model_simplified, check = onnx_simplify(model)
+
+                if check:
+                    onnx.save(model_simplified, save_path)
+                    print(f"  - Simplified successfully")
+                else:
+                    print(f"  - Simplification check failed, keeping original")
+            except ImportError:
+                print(f"  - onnx-simplifier not installed, skipping")
+
+        print(f"[QVit] Export complete: {save_path}")
+        return save_path
+
+    def save_quantized_weights(self, save_path: str):
+        """
+        Save quantized weights and parameters for deployment.
+
+        Saves:
+            - quant_weight (INT8)
+            - scale, zero_point
+            - bias (FP32)
+
+        Args:
+            save_path: Path to save (.pt file)
+        """
+        state = {
+            'model_info': {
+                'embed_dim': self.embed_dim,
+                'num_heads': self.num_heads,
+                'num_classes': self.num_classes,
+                'num_blocks': len(self.blocks)
+            },
+            'quantized_params': {}
+        }
+
+        for name, module in self.named_modules():
+            params = {}
+
+            # INT8 weight
+            if hasattr(module, 'quant_weight') and module.quant_weight is not None:
+                params['quant_weight'] = module.quant_weight.to(torch.int8)
+
+            # Scale & Zero point
+            if hasattr(module, 'weight_scaler'):
+                params['weight_scale'] = module.weight_scaler
+                params['weight_zero'] = module.weight_zero
+            if hasattr(module, 'scaler'):
+                params['scale'] = module.scaler
+                params['zero'] = module.zero
+            if hasattr(module, 'output_scaler') and module.output_scaler is not None:
+                params['output_scale'] = module.output_scaler
+                params['output_zero'] = module.output_zero
+
+            # Bias
+            if hasattr(module, 'bias') and module.bias is not None:
+                params['bias'] = module.bias
+
+            if params:
+                state['quantized_params'][name] = params
+
+        torch.save(state, save_path)
+        print(f"[QVit] Quantized weights saved: {save_path}")
+        print(f"  - Layers: {len(state['quantized_params'])}")
+
+        return save_path

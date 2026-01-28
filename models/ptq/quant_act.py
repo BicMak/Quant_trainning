@@ -34,6 +34,10 @@ class QAct(nn.Module):
         self.calibration_mode = quant_config.calibration_mode
         self.mode = 'fp32'
 
+        # Quantization params - register_buffer로 ONNX initializer로 인식되게 함
+        self.register_buffer('scaler', None)
+        self.register_buffer('zero', None)
+
         # Head 정보 저장 (head_wise 모드에서 사용)
         self.num_heads = num_heads
         self.head_dim = head_dim

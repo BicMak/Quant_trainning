@@ -20,11 +20,14 @@ class UniformQuantizer(BaseQuantizer):
             num_heads=num_heads,
             head_dim=head_dim,
         )
-        self.scale = None
-        self.zero_point = None
+        # register_buffer로 ONNX initializer로 인식되게 함
+        self.register_buffer('scale', None)
+        self.register_buffer('zero_point', None)
 
     def update_quantization_params(self, scale, zero_point):
-        self.scale, self.zero_point = scale, zero_point
+        # buffer 업데이트
+        self.scale = scale.clone() if isinstance(scale, torch.Tensor) else torch.tensor(scale)
+        self.zero_point = zero_point.clone() if isinstance(zero_point, torch.Tensor) else torch.tensor(zero_point)
 
     def quant(self, inputs, scale=None, zero_point=None):
         if scale is None:

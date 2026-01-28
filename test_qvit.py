@@ -409,3 +409,30 @@ if __name__ == '__main__':
     # Optional: speed test
     if torch.cuda.is_available():
         test_qvit_inference_speed(qvit)
+
+    # Export for deployment
+    print("\n" + "=" * 70)
+    print("[Export] Preparing model for deployment...")
+    print("=" * 70)
+
+    export_dir = Path(__file__).parent / 'export'
+    export_dir.mkdir(exist_ok=True)
+
+    # 1. Strip unnecessary components (Observer, Profiler)
+    qvit.strip_for_deploy()
+
+    # 2. Save quantized weights
+    weights_path = export_dir / 'qvit_weights.pt'
+    qvit.save_quantized_weights(str(weights_path))
+
+    # 3. Export to ONNX
+    onnx_path = export_dir / 'qvit_int8.onnx'
+    try:
+        qvit.export_onnx(str(onnx_path))
+    except Exception as e:
+        print(f"  ONNX export failed: {e}")
+        print("  (This is expected if onnx/onnxsim is not installed)")
+
+    print("\n[Export] Complete!")
+    print(f"  - Weights: {weights_path}")
+    print(f"  - ONNX: {onnx_path}")

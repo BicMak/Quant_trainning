@@ -39,9 +39,10 @@ class QLayerNorm(nn.Module):
         self.num_channels = input_module.weight.size(0)
 
         #LayerNorm specific params
-        self.scale = None
-        self.zero = None
-        self.s_base = None
+        # register_buffer로 ONNX initializer로 인식되게 함
+        self.register_buffer('scale', None)
+        self.register_buffer('zero', None)
+        self.register_buffer('s_base', None)
 
         #1. set layer type & observer
         self.output_observer = init_observers(self.observer_type,

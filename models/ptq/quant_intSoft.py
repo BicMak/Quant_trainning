@@ -49,12 +49,13 @@ class QuantIntSoft(nn.Module):
             self.profiler = profiler(layer_name)
 
         # I-BERT Integer Softmax용 scale (propagation으로 전달받음)
-        self.input_scale = None
-        self.output_scale = None
+        # register_buffer로 ONNX initializer로 인식되게 함
+        self.register_buffer('input_scale', None)
+        self.register_buffer('output_scale', None)
 
         # Quantization parameters
-        self.scaler = None
-        self.zero = None
+        self.register_buffer('scaler', None)
+        self.register_buffer('zero', None)
 
     def calibration(self, x, input_scale=None):
         """

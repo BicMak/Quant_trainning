@@ -28,9 +28,9 @@ k = self.attn_k_out.forward(k)  # (B, N, C)
 v = self.attn_v_input.forward(v)  # (B, N, C)
 ```
 - 아래 이미지를 보면 linear 가중치 적용 후 query와 key는 유사한 분포를 가지고 있지만 value 같은경우에는 상단의 2개의 값과 분포가 차이가 발생함
-![alt text](image.png)
-![alt text](image-1.png)
-![alt text](image-2.png)
+![alt text](/docs/images/image-1.png)
+![alt text](/docs/images/image-1.png)
+![alt text](/docs/images/image-2.png)
 
 ### 중복 양자화 문제
 ```python 
