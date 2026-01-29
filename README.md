@@ -52,16 +52,24 @@ pip install torch torchvision timm onnx onnxsim tensorrt pycuda
 - QSNR varies significantly across layer types due to outlier distribution after attention
 - However, this does not directly affect overall accuracy
 
-![Outlier Analysis](./docs/images/outlier_analysis.png)
-
-- Outlier ratio shows linear correlation between FP32 and INT8
-
 ### 4.2 Cosine Similarity: **95.5%+**
 
 ![Cosine Similarity Analysis](./docs/images/cosine_sim_analysis.png)
 
 - Most quantized layers achieve >99% cosine similarity, while end-to-end similarity is 95.5% due to error accumulation. This has minimal impact on final accuracy.
 - `intSoftmax` layers show higher variance compared to other layer types
+
+### 4.3 Outlier ratio
+![Outlier Analysis](./docs/images/outlier_analysis.png)
+
+- Outlier ratio shows linear correlation between FP32 and INT8
+- A regression slope other than 1 indicates either a scaler problem or outlier-induced distortion
+
+### 4.4 Fisher Score
+![Outlier Analysis](./log/hessian/sensitivity_plot_20260127_153320.png)
+
+- Overall, blocks closer to the input have higher Fisher scores (more sensitive)
+- However, QSNR does not necessarily correlate with Fisher score; interestingly, mid-importance layers show lower QSNR
 
 ## 5. Quantization Configuration
 
@@ -100,12 +108,6 @@ class BitTypeConfig:
 ```bash
 python test_qvit.py
 ```
-
-### 6.2 Analyze Results
-```bash
-python result_analyze.py
-```
-
 
 ## 7. Output Files
 
